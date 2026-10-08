@@ -45,7 +45,8 @@ from .coordinator import (
     HuaweiInfoCoordinator,
     HuaweiStorageData,
 )
-from .entity import _account_key, find_main_device, main_device_identifier, main_device_info
+from .entity import _account_key, main_device_identifier, main_device_info
+from .account_login import async_register_websocket
 from .panel import async_register_panel, async_unregister_panel
 from .services import async_register_services
 from .views import async_register_views, async_unregister_views
@@ -391,6 +392,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiConfigEntry) -> bo
     # 先把 UI 与接口注册好：首次云端刷新（MQTT startService 等）可能偏慢，
     # 若排在后面，面板与状态接口会长时间不可用。
     async_register_views(hass)
+    async_register_websocket(hass)
     await async_register_panel(hass)
     await async_register_services(hass)
 
@@ -512,10 +514,9 @@ def _async_register_main_device(hass: HomeAssistant, entry: HuaweiConfigEntry) -
     registry = dr.async_get(hass)
     identifier, _ = main_device_identifier(entry)
 
-    # 跨条目查已有主设备（同一物理设备被多账号接入时复用，避免 HA 因
-    # config_entry_id 不同而新建重复设备）。用 entity.find_main_device 统一
-    # 走新 API，避免 async_get_device 的弃用警告（2027.8.0 移除）。
-    existing = find_main_device(registry, identifier)
+    # 用 async_get_device 按 identifier 查（registry.devices 的映射式访问自
+    # HA 2026.10 起被弃用，2027.9 将移除；见启动日志的 frame 警告）。
+    existing = registry.async_get_device(identifiers={(DOMAIN, identifier)})
     if existing is not None:
         _LOGGER.debug("复用已有主设备: %s（%s）", existing.name, existing.id)
         return existing.id

@@ -337,6 +337,46 @@ h2.view-title{
 .filerow .fname{flex:1;font-size:13px;word-break:break-all}
 .filerow .fsize{font-size:12px;color:var(--text2);flex:none;font-variant-numeric:tabular-nums}
 
+/* ========== 登录弹窗 ========== */
+.modal{
+  position:fixed;inset:0;z-index:1000;display:flex;align-items:center;justify-content:center;
+  background:rgba(10,14,20,.6);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);
+  animation:vfade .2s ease both;padding:18px;
+}
+.mbox{
+  width:100%;max-width:420px;max-height:88vh;overflow:auto;
+  background:var(--card);border-radius:20px;box-shadow:0 24px 60px rgba(10,14,20,.35);
+  padding:24px;animation:mup .26s cubic-bezier(.22,1,.36,1) both;
+}
+@keyframes mup{from{opacity:0;transform:translateY(14px) scale(.98)}to{opacity:1;transform:none}}
+.mbox h3{margin:0 0 6px;font-family:var(--font-display);font-size:17px;font-weight:700}
+.mbox p.sub{margin:0 0 18px;font-size:12.5px;color:var(--text2);line-height:1.5}
+.field{margin-bottom:14px}
+.field label{display:block;font-size:12px;font-weight:600;color:var(--text2);margin-bottom:6px}
+.field input,.field select{
+  width:100%;padding:11px 13px;border-radius:11px;font-size:14px;
+  border:1px solid var(--divider);background:var(--bg);color:var(--text);
+  font-family:var(--font-body);transition:border-color .16s,box-shadow .16s;
+}
+.field input:focus,.field select:focus{
+  outline:none;border-color:var(--brand);box-shadow:0 0 0 3px var(--brand-soft);
+}
+.merr{
+  background:var(--danger-soft);color:var(--danger);font-size:12.5px;font-weight:500;
+  padding:9px 12px;border-radius:10px;margin-bottom:14px;
+}
+.mnote{
+  background:var(--brand-soft);color:var(--brand);font-size:12px;
+  padding:9px 12px;border-radius:10px;margin-bottom:14px;line-height:1.5;
+}
+.mactions{display:flex;gap:10px;margin-top:6px}
+.mactions .btn{flex:1}
+.steps{display:flex;gap:6px;margin-bottom:18px}
+.steps i{
+  flex:1;height:3px;border-radius:2px;background:var(--divider);
+}
+.steps i.on{background:var(--brand)}
+
 /* ========== 手机：底栏导航 ========== */
 @media (max-width:820px){
   .topbar{padding:0 15px;height:56px}
@@ -376,6 +416,9 @@ h2.view-title{
   .acct{padding:5px 10px;font-size:11.5px}
   .users{grid-template-columns:repeat(2,1fr);gap:10px}
   .ucard{padding:13px;border-radius:13px}
+  .modal{align-items:flex-end;padding:0}
+  .mbox{max-width:none;border-radius:20px 20px 0 0;max-height:92vh;
+    padding-bottom:calc(24px + env(safe-area-inset-bottom))}
 }
 `;
 
@@ -704,6 +747,134 @@ function renderNetwork(d){
     </div>`;
 }
 
+/* ---- 面板内登录：三步（账号密码 → 验证码渠道 → 验证码）---- */
+async function _ws(cmd, payload){
+  return new Promise((resolve,reject)=>{
+    function ev(ev2){
+      const d=ev2.data||{};
+      if(d.id!==1) return;
+      window.removeEventListener("message",ev);
+      window.removeEventListener("__hsws",ev);
+      if(d.type==="result"&&d.success) resolve(d.result);
+      else reject(new Error((d.error&&d.error.message)||"请求失败"));
+    }
+    window.addEventListener("__hsws",ev);
+    // HA 的 WS 走 hass.connection；这里用面板注入的连接
+    const hass=(window.__hs_panel&&(window.__hs_panel.hass||window.__hs_panel._hass));
+    const conn=hass&&hass.connection;
+    if(!conn){ reject(new Error("未连接到 Home Assistant")); return; }
+    conn.sendMessagePromise({type:cmd,id:1,...payload}).then(resolve).catch(reject);
+  });
+}
+
+function openLogin(){
+  const m=document.createElement("div");
+  m.className="modal";
+  m.innerHTML=`
+    <div class="mbox">
+      <h3>添加华为账号</h3>
+      <p class="sub">登录后可在此设备查看该账号的相册与文件。密码仅用于本次登录。</p>
+      <div class="steps"><i class="on"></i><i></i><i></i></div>
+      <div id="mBody">
+        <div class="field"><label>华为账号</label>
+          <input id="lgAcct" type="text" placeholder="手机号 / 邮箱" autocomplete="username"></div>
+        <div class="field"><label>密码</label>
+          <input id="lgPwd" type="password" placeholder="登录密码" autocomplete="current-password"></div>
+        <div class="mactions">
+          <button class="btn" data-close>取消</button>
+          <button class="btn pri" id="lgNext">下一步</button>
+        </div>
+      </div>
+    </div>`;
+  (window.__hs_panel&&window.__hs_panel.shadowRoot||document.body).appendChild(m);
+  const close=()=>m.remove();
+  m.addEventListener("click",(e)=>{ if(e.target===m||e.target.closest("[data-close]")) close(); });
+
+  const entryId=window.__hs_entry_id||"";
+  let flowId=null, password="";
+
+  m.querySelector("#lgNext").addEventListener("click",async()=>{
+    const acct=m.querySelector("#lgAcct").value.trim();
+    password=m.querySelector("#lgPwd").value;
+    if(!acct||!password){ _mErr(m,"请填写账号与密码"); return; }
+    _mBusy(m,"正在登录…");
+    try{
+      const r=await _ws("huawei_home_storage/login_start",
+        {entry_id:entryId,account:acct,password:password});
+      if(r.done){ close(); if(window.__hs_panel) window.__hs_panel._refresh&&window.__hs_panel._refresh();
+        _mToast("账号已添加"); return; }
+      flowId=r.flow_id;
+      _stepChannels(m,r,flowId,close);
+    }catch(err){ _mErr(m,String(err.message||err)); }
+  });
+}
+
+function _stepChannels(m,r,flowId,close){
+  const channels=r.channels||[];
+  m.querySelector(".steps").innerHTML='<i class="on"></i><i class="on"></i><i></i>';
+  m.querySelector("#mBody").innerHTML=`
+    ${r.prompt?`<div class="mnote">${esc(r.prompt)}</div>`:""}
+    ${channels.length?`<div class="field"><label>接收方式</label>
+      <select id="lgCh">${channels.map((c,i)=>
+        `<option value="${esc(c.key)}">${esc(c.label||("方式 "+(i+1)))}</option>`).join("")}
+      </select></div>`:""}
+    <div class="mactions">
+      <button class="btn" data-close>取消</button>
+      <button class="btn pri" id="lgSend">获取验证码</button>
+    </div>`;
+  m.querySelector("#lgSend").addEventListener("click",async()=>{
+    const sel=m.querySelector("#lgCh");
+    _mBusy(m,"正在发送…");
+    try{
+      const r2=await _ws("huawei_home_storage/login_channel",
+        {flow_id:flowId,channel:sel?sel.value:null});
+      _stepCode(m,r2,flowId,close);
+    }catch(err){ _mErr(m,String(err.message||err)); }
+  });
+}
+
+function _stepCode(m,r,flowId,close){
+  m.querySelector(".steps").innerHTML='<i class="on"></i><i class="on"></i><i class="on"></i>';
+  m.querySelector("#mBody").innerHTML=`
+    ${r.prompt?`<div class="mnote">${esc(r.prompt)}</div>`:""}
+    <div class="field"><label>验证码</label>
+      <input id="lgCode" type="text" placeholder="请输入验证码" autocomplete="one-time-code"></div>
+    <div class="mactions">
+      <button class="btn" data-close>取消</button>
+      <button class="btn pri" id="lgDone">完成登录</button>
+    </div>`;
+  m.querySelector("#lgDone").addEventListener("click",async()=>{
+    const code=m.querySelector("#lgCode").value.trim();
+    if(!code){ _mErr(m,"请输入验证码"); return; }
+    _mBusy(m,"正在验证…");
+    try{
+      await _ws("huawei_home_storage/login_code",{flow_id:flowId,code:code});
+      close(); _mToast("账号已添加");
+      if(window.__hs_panel) window.__hs_panel._load&&window.__hs_panel._load();
+    }catch(err){ _mErr(m,String(err.message||err)); }
+  });
+}
+
+function _mErr(m,msg){
+  let box=m.querySelector(".merr");
+  if(!box){ box=document.createElement("div"); box.className="merr";
+    m.querySelector("#mBody").prepend(box); }
+  box.textContent=msg;
+}
+function _mBusy(m,msg){
+  const b=m.querySelector("#mBody .btn.pri");
+  if(b){ b.disabled=true; b.textContent=msg; }
+}
+function _mToast(msg){
+  const t=document.createElement("div");
+  t.className="pill"; t.style.cssText=
+    "position:fixed;left:50%;bottom:26px;transform:translateX(-50%);z-index:2000;"+
+    "background:var(--brand);color:#fff;padding:10px 18px;box-shadow:var(--sh-2)";
+  t.textContent=msg;
+  (window.__hs_panel&&window.__hs_panel.shadowRoot||document.body).appendChild(t);
+  setTimeout(()=>t.remove(),2600);
+}
+
 /* 用户视图：设备上的成员 + 当前账号信息（均脱敏） */
 function renderUsers(d){
   const total=(d.device_users||[]).length;
@@ -749,7 +920,9 @@ function renderUsers(d){
     + '<span class="hint">共 '+accs.length+' 个</span></div>'
     + (rows||'<div class="slot">暂无账号</div>')
     + '<div style="margin-top:12px;font-size:12px;color:var(--text2)">'
-    + '多账号各自独立隧道与相册视角 —— 顶部切换账号可查看不同内容。</div></div>';
+    + '多账号各自独立隧道与相册视角 —— 顶部切换账号可查看不同内容。</div>'
+    + '<div class="actions" style="margin-top:14px">'
+    + '<button class="btn pri" data-act="add-account">＋ 添加华为账号</button></div></div>';
 }
 
 function renderBackup(){
@@ -917,6 +1090,9 @@ class HuaweiStoragePanel extends HTMLElement {
     this._main().innerHTML=
       (this._error?`<div class="card" style="border-left:4px solid var(--danger)">
         加载失败：${esc(this._error)}</div>`:"")+v.render(this._data());
+    this._main().querySelectorAll("[data-act]").forEach((b)=>{
+      if(b.dataset.act==="add-account") b.addEventListener("click",()=>openLogin());
+    });
     const on=!!d.online;
     const p=this.shadowRoot.getElementById("onlinePill");
     p.className="pill"+(on?"":" off");
