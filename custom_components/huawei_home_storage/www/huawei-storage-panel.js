@@ -230,6 +230,53 @@ h2.view-title{
 .btn[disabled]{opacity:.55;cursor:not-allowed;transform:none}
 .actions{display:flex;flex-wrap:wrap;gap:11px}
 
+/* ========== 多账号切换器 ========== */
+.accts{display:flex;align-items:center;gap:6px;margin-right:4px}
+.accts:empty{display:none}
+.acct{
+  display:inline-flex;align-items:center;gap:7px;cursor:pointer;
+  padding:6px 12px;border-radius:999px;font-size:12px;font-weight:600;
+  border:1px solid var(--divider);background:var(--card);color:var(--text2);
+  transition:background .16s,color .16s,border-color .16s,box-shadow .16s;
+  white-space:nowrap;
+}
+.acct:hover{background:var(--brand-soft);color:var(--text)}
+.acct.on{
+  background:var(--brand-soft);color:var(--brand);border-color:var(--brand-line);
+  box-shadow:0 0 0 1px var(--brand-line);
+}
+.acct .av{
+  width:22px;height:22px;border-radius:50%;display:grid;place-items:center;
+  background:linear-gradient(140deg,var(--brand-2),var(--brand));color:#fff;
+  font-size:10.5px;font-weight:700;flex:none;
+}
+.acct .n{font-variant-numeric:tabular-nums}
+.acct .badge{
+  font-size:10px;font-weight:700;padding:1px 6px;border-radius:99px;
+  background:var(--brand);color:#fff;
+}
+
+/* 用户卡片 */
+.users{display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(210px,1fr))}
+.ucard{
+  background:var(--card);border-radius:14px;box-shadow:var(--sh-1),var(--ring);
+  padding:15px;display:flex;gap:12px;align-items:center;
+  transition:transform .16s,box-shadow .16s;
+}
+.ucard:hover{transform:translateY(-2px);box-shadow:var(--sh-2),var(--ring)}
+.ucard .uav{
+  width:40px;height:40px;flex:none;border-radius:50%;display:grid;place-items:center;
+  background:var(--brand-soft);color:var(--brand);font-size:15px;font-weight:700;
+}
+.ucard.admin .uav{background:var(--warn-soft);color:var(--warn)}
+.ucard .un{font-weight:600;font-size:13.5px}
+.ucard .ur{font-size:11.5px;color:var(--text2);margin-top:2px}
+.ucard .utag{
+  margin-left:auto;font-size:10px;font-weight:700;padding:3px 8px;border-radius:99px;
+  background:var(--brand-soft);color:var(--brand);
+}
+.ucard.admin .utag{background:var(--warn-soft);color:var(--warn)}
+
 /* 扩展位 */
 .slot{
   border:1.5px dashed var(--divider);border-radius:15px;padding:28px 18px;text-align:center;
@@ -325,8 +372,11 @@ h2.view-title{
   .btn.danger{flex-basis:100%}
   h2.view-title{font-size:18px;margin-bottom:14px}
   .phgrid{grid-template-columns:repeat(3,1fr);gap:6px}
+  .accts{max-width:52vw;overflow-x:auto;padding:2px}
+  .acct{padding:5px 10px;font-size:11.5px}
+  .users{grid-template-columns:repeat(2,1fr);gap:10px}
+  .ucard{padding:13px;border-radius:13px}
 }
-
 `;
 
 
@@ -336,6 +386,7 @@ const VIEWS = {
   photos  :{icon:"🖼️", title:"相册", render:renderPhotos},
   device  :{icon:"⚙️", title:"设备", render:renderDevice},
   network :{icon:"🌐", title:"网络", render:renderNetwork},
+  users   :{icon:"👥", title:"用户", render:renderUsers},
   backup  :{icon:"☁️", title:"备份", render:renderBackup},
 };
 
@@ -432,12 +483,21 @@ function renderStorage(d){
 
 /* 照片/文件浏览器：基于 /filesvc/files 目录 + thumb 图片代理 */
 const PH_STATE = { path:"/file/", stack:[], data:null, loading:false };
+/* 多用户：当前选中的配置条目(设备)与账号（均为 null = 自动取第一个） */
+const SEL = { entry:null, account:null };
 
 function renderPhotos(d){
-  // 异步加载目录；browsePhotos 会把内容写进 shadow 内的 #phWrap
   setTimeout(()=>browsePhotos(PH_STATE.root||window.__hs_entry_id, PH_STATE.path),0);
+  const cur=d.current_account;
+  const who=cur?(cur.label||"账号"):"设备";
   return `
     <h2 class="view-title">照片与文件</h2>
+    ${cur?`<div class="card" style="padding:13px 16px;margin-bottom:14px">
+      <div style="font-size:12.5px;color:var(--text2)">
+        当前账号：<b style="color:var(--text)">${esc(who)}</b>
+        ${cur.counts&&cur.counts.photos!=null
+          ? ` · 可见照片 ${cur.counts.photos} 张`:""}
+      </div></div>`:""}
     <div id="phWrap"><div class="slot">加载中…</div></div>`;
 }
 
@@ -644,6 +704,54 @@ function renderNetwork(d){
     </div>`;
 }
 
+/* 用户视图：设备上的成员 + 当前账号信息（均脱敏） */
+function renderUsers(d){
+  const total=(d.device_users||[]).length;
+  const accs=d.accounts||[];
+  const cur=d.current_account;
+
+  // 设备成员：后端只给数量（已脱敏），用序号区分
+  let cards="";
+  for(let i=0;i<(d.device_users||[]).length;i++){
+    const admin=(i===0);
+    cards += '<div class="ucard '+(admin?"admin":"")+'">'
+      + '<span class="uav">'+(admin?"管":String(i+1))+'</span>'
+      + '<div><div class="un">'+(admin?"管理员":"成员 "+String(i+1))+'</div>'
+      + '<div class="ur">'+(admin?"设备管理权限":"普通成员")+'</div></div>'
+      + '<span class="utag">'+(admin?"管理员":"成员")+'</span></div>';
+  }
+
+  // 登录账号列表
+  let rows="";
+  for(const a of accs){
+    const c=a.counts||{};
+    const on=cur&&(a.key===cur.key||a.account===cur.account);
+    let line='<div class="row">'
+      + '<span class="k">'+esc(a.label||"账号")
+      + (a.is_primary?' <span class="utag">主</span>':'')
+      + '</span>'
+      + '<span class="v">'+(on?"当前查看":"")
+      + (c.photos!=null?" · 照片 "+c.photos:"")+'</span></div>';
+    if(a.tunnel){
+      line += '<div class="row" style="border-bottom:0"><span class="k" style="font-size:11.5px">隧道</span>'
+        + '<span class="v" style="font-size:11.5px;font-weight:500">'+esc(a.tunnel)+'</span></div>';
+    }
+    rows += line;
+  }
+
+  return '<h2 class="view-title">用户</h2>'
+    + '<div class="card"><div class="card-h">👥 设备成员'
+    + '<span class="hint">共 '+total+' 位</span></div>'
+    + (cards?'<div class="users">'+cards+'</div>':'<div class="slot">暂无成员数据</div>')
+    + '<div style="margin-top:12px;font-size:12px;color:var(--text2)">'
+    + '出于隐私，面板不显示成员的真实姓名与 ID。</div></div>'
+    + '<div class="card"><div class="card-h">🔐 登录账号'
+    + '<span class="hint">共 '+accs.length+' 个</span></div>'
+    + (rows||'<div class="slot">暂无账号</div>')
+    + '<div style="margin-top:12px;font-size:12px;color:var(--text2)">'
+    + '多账号各自独立隧道与相册视角 —— 顶部切换账号可查看不同内容。</div></div>';
+}
+
 function renderBackup(){
   return `
     <h2 class="view-title">备份</h2>
@@ -668,6 +776,7 @@ class HuaweiStoragePanel extends HTMLElement {
           <div class="brand"><span class="logo">🗄️</span>
             <span>家庭存储<span class="sub" id="brandSub"></span></span></div>
           <div class="spacer"></div>
+          <div class="accts" id="accts"></div>
           <span class="pill" id="onlinePill"><i class="dot"></i><span>—</span></span>
         </header>
         <div class="body">
@@ -694,6 +803,66 @@ class HuaweiStoragePanel extends HTMLElement {
     if(h&&!was&&this.shadowRoot.getElementById("main")) this._load();
   }
   get hass(){ return this._hass; }
+
+  /* ---- 多用户选择 ---- */
+  _entry(){
+    const all=(this._status&&this._status.entries)||[];
+    if(!all.length) return null;
+    if(SEL.entry) return all.find((e)=>e.entry_id===SEL.entry)||all[0];
+    return all[0];
+  }
+  _account(){
+    const d=this._entry()||{};
+    const accs=d.accounts||[];
+    if(!accs.length) return null;
+    if(SEL.account) return accs.find((a)=>a.key===SEL.account||a.account===SEL.account)||accs[0];
+    return accs[0];
+  }
+  /** 相册统计：优先用**当前账号**的视角（不同账号看到的数量不同） */
+  _counts(){
+    const a=this._account();
+    if(a&&a.counts) return a.counts;
+    return (this._entry()||{}).counts||{};
+  }
+  /** 组合视图数据：设备级字段 + 账号级 counts */
+  _data(){
+    const d=Object.assign({},this._entry()||{});
+    d.counts=this._counts();
+    const a=this._account();
+    d.current_account=a||null;
+    return d;
+  }
+
+  _renderAccts(d){
+    const box=this.shadowRoot.getElementById("accts");
+    if(!box) return;
+    const accs=d.accounts||[];
+    // 单账号时不显示切换器（避免噪音）
+    if(accs.length<2){
+      const one=accs[0];
+      if(one){
+        box.innerHTML=`<span class="acct on" title="当前账号">
+          <span class="av">${esc((one.label||"?").slice(0,2))}</span>
+          <span class="n">${esc(one.label||"账号")}</span></span>`;
+      }else{ box.innerHTML=""; }
+      return;
+    }
+    const cur=this._account();
+    box.innerHTML=accs.map((a)=>{
+      const on=cur&&(a.key===cur.key||a.account===cur.account);
+      return `<span class="acct ${on?"on":""}" data-acct="${esc(a.key||a.account||"")}">
+        <span class="av">${esc((a.label||"?").slice(0,2))}</span>
+        <span class="n">${esc(a.label||"账号")}</span>
+        ${a.is_primary?'<span class="badge">主</span>':""}
+      </span>`;
+    }).join("");
+    box.querySelectorAll("[data-acct]").forEach((x)=>{
+      x.addEventListener("click",()=>{
+        SEL.account=x.dataset.acct;
+        this._draw();
+      });
+    });
+  }
 
   _nav(){return this.shadowRoot.getElementById("nav");}
   _main(){return this.shadowRoot.getElementById("main");}
@@ -737,7 +906,9 @@ class HuaweiStoragePanel extends HTMLElement {
   }
 
   _draw(){
-    const d=(this._status&&this._status.entries&&this._status.entries[0])||{};
+    const all=(this._status&&this._status.entries)||[];
+    const d=this._entry()||all[0]||{};
+    this._renderAccts(d);
     // 照片浏览器需要 entry_id 与面板引用
     window.__hs_entry_id = d.entry_id || window.__hs_entry_id || "";
     window.__hs_panel = this;
@@ -745,7 +916,7 @@ class HuaweiStoragePanel extends HTMLElement {
     const v=VIEWS[this._view]||VIEWS.overview;
     this._main().innerHTML=
       (this._error?`<div class="card" style="border-left:4px solid var(--danger)">
-        加载失败：${esc(this._error)}</div>`:"")+v.render(d);
+        加载失败：${esc(this._error)}</div>`:"")+v.render(this._data());
     const on=!!d.online;
     const p=this.shadowRoot.getElementById("onlinePill");
     p.className="pill"+(on?"":" off");

@@ -109,6 +109,19 @@ async def _serve_image(
     )
 
 
+def mask_account(value: str) -> str:
+    """账号脱敏：手机号保留前 3 后 4；邮箱保留首字符与域名。"""
+    text = str(value or "")
+    if not text:
+        return "账号"
+    if "@" in text:
+        name, _, domain = text.partition("@")
+        return (name[:1] + "***@" + domain) if domain else name[:1] + "***"
+    if len(text) > 7:
+        return text[:3] + "****" + text[-4:]
+    return text[:1] + "***"
+
+
 def _info(runtime: Any) -> dict[str, Any]:
     """低频信息协调器的数据；未就绪时返回空 dict。"""
     coord = getattr(runtime, "info", None)
@@ -310,6 +323,10 @@ class HuaweiStorageStatusView(HomeAssistantView):
                             "key": a.get("key"),
                             "account": a.get("account") or "",
                             "user": a.get("user") or "",
+                            "uid": a.get("uid") or "",
+                            # 面板用：账号显示名（脱敏）+ 是否当前默认账号
+                            "label": mask_account(a.get("account") or a.get("user") or "账号"),
+                            "is_primary": idx == 0,
                             "tunnel": (
                                 runtime.clients.get(str(a.get("key")))
                                 .credentials.https_url
@@ -319,7 +336,7 @@ class HuaweiStorageStatusView(HomeAssistantView):
                             ),
                             "counts": runtime.counts_of_account(str(a.get("key"))),
                         }
-                        for a in accounts
+                        for idx, a in enumerate(accounts)
                     ],
                     # 以下用于面板展示（MAC 不放进设备注册，避免与路由器等集成冲突）
                     "device_mac": cfg.get(CONF_DEVICE_MAC) or "",
