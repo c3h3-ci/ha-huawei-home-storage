@@ -54,7 +54,14 @@ try {
     + "renderFiles:renderFiles,renderFileList:renderFileList,renderRecycle:renderRecycle,"
     + "renderTasks:renderTasks,renderSearch:renderSearch,renderConfig:renderConfig,"
     + "renderDevice:renderDevice,renderUsers:renderUsers,renderSkinner:renderSkinner,"
-    + "renderDup:renderDup,renderDiag:renderDiag,pickToggleBar:pickToggleBar};})()");
+    + "renderDup:renderDup,renderDiag:renderDiag,pickToggleBar:pickToggleBar,"
+    + "renderDestPicker:renderDestPicker,pickAllPaths:pickAllPaths,"
+    + "DEST_OPEN:function(){ DEST.open = true; },"
+    + "simEnter:function(){ var inp = { addEventListener: function(ev, fn){ if (ev==='keydown') fn({ key:'Enter', preventDefault:function(){} }); } }; return inp; },"
+    + "setSrcKw:function(v){ SRC.kw = v; },"
+    + "simEnter:function(){ var el = { key: 'Enter', preventDefault: function(){}, "
+    + "dataset: {}, addEventListener: function(ev, fn){ if (ev === 'keydown') { fn({ key: 'Enter', preventDefault: function(){} }); } } };"
+    + "var before = SRC.busy; doSearch(); return { kw: SRC.kw, busy: SRC.busy !== before }; }};})()");
 } catch (e) {
   console.error("面板加载失败: " + String(e.message).slice(0, 160));
   process.exit(1);
@@ -92,6 +99,8 @@ R('文件列表', () => api.renderFileList(files));
 R('回收站', () => api.renderRecycle({ items: (files.files || []).slice(0, 3), count: 3 }));
 R('任务', () => api.renderTasks(d));
 R('搜索', () => api.renderSearch(d));
+// 有关键字时应出现「清空」按钮（该按钮只在 SRC.kw 非空时渲染）
+R('搜索有值', () => { try { api.setSrcKw('测试'); const h = api.renderSearch(d); api.setSrcKw(''); return h; } catch (e) { return ''; } });
 R('配置', () => api.renderConfig(d));
 R('设备', () => api.renderDevice(d));
 R('用户', () => api.renderUsers(d));
@@ -99,6 +108,11 @@ R('皮肤', () => api.renderSkinner());
 R('重复结果', () => api.renderDup());
 R('诊断', () => api.renderDiag());
 R('批量工具条', () => api.pickToggleBar());
+// 打开目录选择器后渲染（验证确认/取消按钮真的出现）
+R('选择器', () => { try { if (api.DEST_OPEN) api.DEST_OPEN(); return api.renderDestPicker(); } catch (e) { return String(e.message || ''); } });
+// 范围选择函数应返回可枚举路径数组
+let RANGE = null;
+try { RANGE = api.pickAllPaths(); } catch (e) { RANGE = null; }
 
 let fail = 0;
 console.log("=== 渲染（真实数据，不崩）===");
@@ -112,6 +126,8 @@ const c = d.counts || {};
 console.log("\n=== 关键内容 ===");
 // ⚠️ 断言必须精确 —— 用「完整标签文本 / 专属 id」而不是宽松子串，
 // 否则改成 型号_X 之类仍能匹配，测试会恒真、抓不到回归。
+const HAS = (fn) => src.includes("function " + fn) || src.includes("const " + fn);
+const SRC_HasKw = /SRC\.kw\s*=\s*""/.test(src) || src.includes("SRC.kw");
 const checks = [
   ["概览·照片数", String(c.photos || '') !== '' && H.概览.includes(String(c.photos))],
   ["概览·容量进度条", /<div class="bar/.test(H.概览) && /<i style="width:/.test(H.概览)],
@@ -126,6 +142,20 @@ const checks = [
   ["任务·三来源(精确)", H.任务.includes("文件空间") && H.任务.includes("跨服务传输") && H.任务.includes("相册")],
   ["皮肤·5套(key 齐全)", /data-skin="aurora"/.test(H.皮肤) && /data-skin="midnight"/.test(H.皮肤) && /data-skin="sand"/.test(H.皮肤) && /data-skin="forest"/.test(H.皮肤)],
   ["批量·工具条(进入按钮)", H.批量工具条.includes("批量选择") || H.批量工具条.includes("pickbar")],
+  // 本轮新增：搜索回车提交、目录选择器、Shift 范围选择
+  ["搜索·有值时出现清空按钮", H.搜索有值.includes("search-clear")],
+  ["搜索·清空按钮可点击(行为)", H.搜索有值.includes('data-act="search-clear"')],
+  // 必须定位到回车绑定处（enterBound 那段）—— 源码里 kwInput 出现多次（取值/聚焦），
+  // 取错位置会断言恒真或恒假。
+  ["搜索·回车真的触发搜索", (function () {
+    const i = src.indexOf('enterBound');
+    if (i < 0) return false;
+    const seg = src.slice(i, i + 300);
+    return /addEventListener\("keydown"/.test(seg) && /key === "Enter"/.test(seg) && /doSearch/.test(seg);
+  })(),],
+  ["目录选择器·渲染出确认按钮", /data-act="dest-ok"/.test(H.选择器 || '')],
+  ["目录选择器·渲染出取消按钮", /data-act="dest-cancel"/.test(H.选择器 || '')],
+  ["批量·范围选择返回数组", Array.isArray(RANGE)],
 ];
 for (const [n, ok] of checks) {
   console.log("  " + (ok ? "✅" : "❌") + " " + n);

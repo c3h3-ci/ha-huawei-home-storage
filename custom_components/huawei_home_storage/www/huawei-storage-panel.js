@@ -601,7 +601,14 @@ async function dupResult() {
 }
 
 /* ============ 批量选择（多选后批量操作）============ */
-const PICK = { on: false, set: new Set(), base: "/file/" };
+const PICK = { on: false, set: new Set(), base: "/file/", last: null };
+
+/** 当前列表所有可勾选路径（顺序稳定，供 Shift 范围选择用）。 */
+function pickAllPaths() {
+  const base = PH.path || "/file/";
+  const files = (PH.data && PH.data.files) || [];
+  return files.map((f) => base + f.name + (f.type === 8 ? "" : "/"));
+}
 
 function pickCount() { return PICK.set.size; }
 
@@ -637,15 +644,16 @@ async function pickRun(op) {
   if (op === "delete") {
     if (!window.confirm("删除选中的 " + ids.length + " 项？\n\n会移入设备回收站，可恢复。")) return;
   } else {
-    const dest = window.prompt("目标文件夹（需以 /file/ 开头且已存在）：", PICK.base);
-    if (!dest) return;
-    try {
-      await svc(op === "move" ? "move_paths" : "copy_paths",
-                { paths: ids, dest_dir: dest, category: curSpace() });
-      toast("已" + label + " " + ids.length + " 项");
-      PICK.on = false; PICK.set.clear();
-      loadFiles();
-    } catch (e) { toast(label + "失败：" + String(e.message || e)); }
+    // 用目录选择器代替手输路径（手打 /file/xxx/ 容易错）
+    openDestPicker(async (dest) => {
+      try {
+        await svc(op === "move" ? "move_paths" : "copy_paths",
+                  { paths: ids, dest_dir: dest, category: curSpace() });
+        toast("已" + label + " " + ids.length + " 项");
+        PICK.on = false; PICK.set.clear();
+        loadFiles();
+      } catch (e) { toast(label + "失败：" + String(e.message || e)); }
+    });
     return;
   }
   try {
@@ -1037,6 +1045,7 @@ function renderFiles(d) {
         <button class="btn sm pri" data-act="fs-upload">⬆ 上传文件</button>
         <input type="file" id="fsFile" style="display:none">` : ""}
     </div>
+    ${renderDestPicker()}
     ${pickToggleBar()}
     ${PH.upload ? `<div class="card" style="padding:12px 16px">
       <div style="display:flex;align-items:center;gap:10px;font-size:12.5px">
@@ -1302,16 +1311,15 @@ function openRowMenu({ name, path, isDir }) {
           },
         });
       } else if (op === "move" || op === "copy") {
-        openPrompt({
-          title: op === "move" ? "移动到" : "复制到",
-          label: "目标文件夹", value: dir,
-          hint: "目标目录必须已存在（目录需带尾斜杠）。",
-          onOk: async (dest) => {
-            const d = dest.endsWith("/") ? dest : dest + "/";
+        openDestPicker(async (dest) => {
+          try {
             await svc(op === "move" ? "move_paths" : "copy_paths",
-                      { paths: [path], dest_dir: d, category: curSpace() });
-            toast(op === "move" ? "已移动" : "已复制"); loadFiles();
-          },
+                      { paths: [path], dest_dir: dest, category: curSpace() });
+            toast(op === "move" ? "已移动" : "已复制");
+            loadFiles();
+          } catch (e) {
+            toast((op === "move" ? "移动" : "复制") + "失败：" + String(e.message || e));
+          }
         });
       } else if (op === "delete") {
         if (!window.confirm(`删除「${name}」？\n\n会移入回收站，可从「最近删除」恢复。`)) return;
@@ -1567,15 +1575,68 @@ async function cleanTasks(ids, label) {
   }
 }
 
+/* ---------- 目录选择器（替代手输路径）---------- */
+const DEST = { open: false, dirs: [], busy: false, err: "", cur: "/file/", cb: null };
+
+async function openDestPicker(cb) {
+  const panel = window.__hs_panel;
+  DEST.open = true; DEST.cb = cb; DEST.err = ""; DEST.cur = PH.path || "/file/";
+  await loadDestDirs(DEST.cur);
+  if (panel) panel._draw();
+}
+
+async function loadDestDirs(path) {
+  const panel = window.__hs_panel;
+  DEST.busy = true; DEST.err = "";
+  if (panel) panel._draw();
+  try {
+    const eid = window.__hs_entry_id || "";
+    const q = `path=${encodeURIComponent(path)}&space=${encodeURIComponent(curSpace())}`;
+    const res = await apiGet(`/api/huawei_home_storage/files/${encodeURIComponent(eid)}?${q}`);
+    DEST.dirs = (res.files || []).filter((f) => f.type !== 8).map((f) => ({
+      name: f.name, path: path + f.name + "/",
+    }));
+    DEST.cur = path;
+  } catch (e) { DEST.err = String(e.message || e); DEST.dirs = []; }
+  DEST.busy = false;
+  if (panel) panel._draw();
+}
+
+function renderDestPicker() {
+  if (!DEST.open) return "";
+  const parent = DEST.cur.replace(/[^/]+\/$/, "") || "/file/";
+  return `<div class="modal">
+    <div class="mbox">
+      <h3>选择目标文件夹</h3>
+      <p class="sub">当前：${esc(DEST.cur)}（点文件夹进入，点「选这里」确认）</p>
+      ${DEST.err ? `<div class="err">${esc(DEST.err)}</div>` : ""}
+      ${DEST.busy ? '<div class="slot sm">载入中…</div>' : `
+        ${DEST.cur !== "/file/" ? `<div class="filerow dir" data-act="dest-go" data-path="${esc(parent)}">
+          <span class="fico">[..]</span>
+          <span class="fmain"><span class="fname">上一级</span></span></div>` : ""}
+        ${DEST.dirs.length ? DEST.dirs.map((d) => `<div class="filerow dir" data-act="dest-go" data-path="${esc(d.path)}">
+          <span class="fico">[D]</span>
+          <span class="fmain"><span class="fname">${esc(d.name)}</span></span></div>`).join("")
+          : '<div class="slot sm">该目录下没有子文件夹</div>'}
+      `}
+      <div class="mactions">
+        <button class="btn" data-act="dest-cancel">取消</button>
+        <button class="btn pri" data-act="dest-ok">选这里</button>
+      </div>
+    </div>
+  </div>`;
+}
+
 /* ---------- 搜索（文件空间）---------- */
 function renderSearch() {
   return `
     <div class="vhead"><h2>搜索</h2>
       <span class="sub">按关键字查找文件空间</span></div>
     <div class="searchbar">
-      <input id="kwInput" type="text" placeholder="输入关键字后回车"
+      <input id="kwInput" type="text" placeholder="输入关键字后按回车"
         value="${esc(SRC.kw)}" autocomplete="off">
       <button class="btn pri" data-act="search-go">搜索</button>
+      ${SRC.kw ? `<button class="btn sm" data-act="search-clear">清空</button>` : ""}
     </div>
     ${renderSearchBody()}`;
 }
@@ -2172,6 +2233,14 @@ class HuaweiStoragePanel extends HTMLElement {
       + v.render(d);
 
     this._wire();
+    // 搜索框：回车即搜索（placeholder 承诺了"回车"，之前没绑，是 bug）
+    const kwEl = this.shadowRoot.getElementById("kwInput");
+    if (kwEl && !kwEl.dataset.enterBound) {
+      kwEl.dataset.enterBound = "1";
+      kwEl.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter") { ev.preventDefault(); doSearch(); }
+      });
+    }
     queueImages(this._main());
     if (this._view === "files") loadFiles();
     if (this._view === "tasks") loadTasks();
@@ -2217,6 +2286,10 @@ class HuaweiStoragePanel extends HTMLElement {
         } else if (act === "task-clean-all") {
           const ids = ((TASK.data && TASK.data.tasks) || []).map((t) => t.taskId);
           cleanTasks(ids, "本来源全部 " + ids.length + " 条记录");
+        } else if (act === "search-clear") {
+          SRC.kw = ""; SRC.res = null; SRC.err = "";
+          this._draw();
+          setTimeout(() => { const i = this.shadowRoot.getElementById("kwInput"); if (i) i.focus(); }, 60);
         } else if (act === "search-go") {
           doSearch();
         } else if (act === "pick-on") {
@@ -2227,15 +2300,26 @@ class HuaweiStoragePanel extends HTMLElement {
           this._draw();
         } else if (act === "pick") {
           e.stopPropagation();
-          togglePick(el.dataset.path);
+          // Shift 点击：从上一次勾选到当前，批量区间选择
+          if (e.shiftKey && PICK.last != null) {
+            const all = pickAllPaths();
+            const a = all.indexOf(PICK.last), b = all.indexOf(el.dataset.path);
+            if (a >= 0 && b >= 0) {
+              const [lo, hi] = a < b ? [a, b] : [b, a];
+              for (let i = lo; i <= hi; i++) PICK.set.add(all[i]);
+            } else { togglePick(el.dataset.path); }
+          } else {
+            togglePick(el.dataset.path);
+          }
+          PICK.last = el.dataset.path;
           this._draw();
         } else if (act === "pick-all") {
           const all = [...(PH.data && PH.data.files || [])].map((f) =>
             PH.path + f.name + (f.type === 8 ? "" : "/"));
-          PICK.set = new Set(all);
+          PICK.set = new Set(all); PICK.last = null;
           this._draw();
         } else if (act === "pick-none") {
-          PICK.set.clear();
+          PICK.set.clear(); PICK.last = null;
           this._draw();
         } else if (act === "pick-move") { pickRun("move");
         } else if (act === "pick-copy") { pickRun("copy");
@@ -2264,6 +2348,16 @@ class HuaweiStoragePanel extends HTMLElement {
           dupResult();
         } else if (act === "diag") {
           diagLoad();
+        } else if (act === "dest-go") {
+          loadDestDirs(el.dataset.path);
+        } else if (act === "dest-cancel") {
+          DEST.open = false; DEST.cb = null;
+          this._draw();
+        } else if (act === "dest-ok") {
+          const cb = DEST.cb, d = DEST.cur;
+          DEST.open = false; DEST.cb = null;
+          this._draw();
+          if (cb) cb(d);
         } else if (act === "photo-open") {
           openViewer(ALB.photos, Number(el.dataset.idx));
         } else if (act === "file-open") {
@@ -2278,6 +2372,14 @@ class HuaweiStoragePanel extends HTMLElement {
         } else if (act === "fs-go") {
           // 点在行内的 ⋯ 上时不要跟着进目录
           if (e.target.closest('[data-act="row-menu"]')) return;
+          // 多选模式下点行即勾选（不必精准点小复选框）
+          if (PICK.on) {
+            e.stopPropagation();
+            togglePick(el.dataset.path);
+            PICK.last = el.dataset.path;
+            this._draw();
+            return;
+          }
           PH.path = el.dataset.path;
           if (PICK.on) { PICK.set.clear(); }
           loadFiles();
