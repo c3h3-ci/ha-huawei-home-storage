@@ -101,6 +101,10 @@ API_ALBUM_INC = "/gallery/albumIncInfo"          # 相册增量表（GET，抓�
 API_ALBUM_MEMBERS = "/gallery/albumMembIncInfo"  # 成员增量表（GET，抓包实据 2026-10-09）
 API_ALBUM_CFG = "/gallery/albumCfg"              # 相册元数据+封面原图（GET，抓包实据 2026-10-09）
 API_PHOTOS_INC = "/gallery/getIncPhotosInfoTable"
+# 全量照片表（App 插件 RequestUri$GalleryUri.FULL_LIST 确认存在）。
+# 与增量的区别：增量是「变化的部分」（preRowId 游标），全量是「从头拉全部」
+# —— 面板首次加载 / 本地缓存重建时用它，避免逐张 album_photos 往返（2.5 万张不可行）。
+API_PHOTOS_FULL = "/gallery/getFullPhotosInfoTable"
 API_QUERY_BIN = "/gallery/queryBin"
 API_FILES = "/filesvc/files"
 API_RECYCLE = "/filesvc/recycleFiles"
