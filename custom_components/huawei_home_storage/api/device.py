@@ -12,9 +12,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
+import zlib
 import random
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -32,6 +34,17 @@ from ..const import (
     API_CANCEL_UPLOAD,
     API_CLEAN_TASK_RECORD,
     API_DISK_CHANGE,
+    API_DYNAMIC_INFO,
+    API_PLUGIN_ADD,
+    API_PLUGIN_ALL,
+    API_PLUGIN_AUTOUPG,
+    API_PLUGIN_CANCEL,
+    API_PLUGIN_CONFIRM,
+    API_PLUGIN_DELETE,
+    API_PLUGIN_MARKET,
+    API_PLUGIN_PAUSE,
+    API_PLUGIN_RESUME,
+    API_PLUGIN_XUNLEI,
     API_FILES,
     API_HEARTBEAT,
     API_PHOTOS_INC,
@@ -41,7 +54,6 @@ from ..const import (
     API_SELECTED_PHOTOS_INFO,
     API_USB_STATUS,
     API_PREPARE_UPLOAD,
-    API_CANCEL_UPLOAD,
     API_BATCH_OPERATION,
     API_MKDIR,
     API_RENAME,
@@ -120,6 +132,28 @@ from .huawei_cloud import DeviceCredentials, HuaweiCloudAuthError, HuaweiCloudEr
 _LOGGER = logging.getLogger(__name__)
 
 CredsProvider = Callable[[], Awaitable[DeviceCredentials]]
+
+
+def _decompress_plugin_payload(payload: Any) -> Any:
+    """把 /acelite/*_infos 里 zlib+base64 压缩的字段还原成 dict。
+
+    设备对 ``market_infos`` 返回 ``{"hapInfos": "<base64(zlib(json))>"}``；
+    ``all_infos`` 则是明文。这里两种都兼容：字符串就尝试解压，
+    失败时原样保留（不吞数据）。
+    """
+    if not isinstance(payload, dict):
+        return payload
+    result = dict(payload)
+    for key in ("hapInfos", "marketInfos", "allInfos"):
+        raw = result.get(key)
+        if not isinstance(raw, str) or len(raw) < 16:
+            continue
+        try:
+            decoded = zlib.decompress(base64.b64decode(raw))
+            result[key] = json.loads(decoded)
+        except Exception:  # noqa: BLE001 - 解不开就保留原文
+            continue
+    return result
 
 
 class HuaweiDeviceError(Exception):
@@ -924,6 +958,43 @@ class HuaweiDeviceClient:
                 next_row = mrow
         return {"photos": photos, "lastCreTime": next_cre, "lastRowId": next_row}
 
+    async def async_get_dynamic_info(
+        self,
+        owner_id: int = 0,
+        data_type: int = 0,
+        album_id: int = 0,
+        album_type: int = 0,
+        add_time: int = 0,
+        dynamic_num: int = 20,
+        pic_num: int = 9,
+    ) -> dict[str, Any]:
+        """动态 / 时光轴 / 回忆（``GET /gallery/getDynamicInfo``）。
+
+        **完整** QueryMap 键取自插件 ``AlbumApi.l(Param, Callback)``，共 9 个：
+
+            clientType, albumId, albumType, albumDynamicNum,
+            albumPicNum, addTime, ownerId, dataType, deviceId
+
+        默认值对齐 ``AlbumDynamicPresenter`` 里的设置：
+        ``setAlbumDynamicNum(20)`` / ``setAlbumPicNum(9)``。
+        ``clientType`` 与 ``deviceId`` 由 ``_common_params`` 自动补。
+
+        ⚠️ 实测（2026-10-28）：只带 ownerId/dataType/deviceId 三个键时，
+        任何 dataType 都返回 ``code=30101``（大概率是缺必填项），
+        所以这里把 9 个键全部带上。
+        """
+        req: dict[str, Any] = {
+            "albumId": int(album_id),
+            "albumType": int(album_type),
+            "albumDynamicNum": int(dynamic_num),
+            "albumPicNum": int(pic_num),
+            "addTime": int(add_time),
+            "ownerId": int(owner_id),
+            "dataType": int(data_type),
+        }
+        data = await self._request(API_DYNAMIC_INFO, req)
+        return data.get("data") if isinstance(data, dict) else data
+
     async def async_get_photos_table(self, pre_row_id: int = 0) -> dict[str, Any]:
         """照片增量表：``{deviceId, fileId, operation, rowId}``，固定 500 条/页。"""
         return await self._request(API_PHOTOS_INC, {"preRowId": pre_row_id})
@@ -1054,6 +1125,148 @@ class HuaweiDeviceClient:
         """
         return await self._request(API_PLUGIN_INSTALLED)
 
+    async def async_get_plugin_market(self, decompress: bool = True) -> Any:
+        """应用市场里的可安装插件（``GET /acelite/market_infos``）。
+
+        ⚠️ 设备返回的 ``data.hapInfos`` 是 **base64 → zlib → JSON** 的压缩串
+        （2026-10-28 实测解出），解压后形如：
+
+            {"sign": "...", "allList": [
+                {"appId","pkgName","name","versionName","versionCode",
+                 "iconUrl","downloadUrl","size", ...}, ...]}
+
+        注意市场里的键是 ``iconUrl`` / ``downloadUrl``（小写 url），而
+        ``hap_add`` 的 ``PluginAddRequestBean`` 用 ``iconURL`` / ``downloadURL``
+        —— 安装方法里做了这层映射。
+
+        ``decompress=False`` 时返回原始未解压结构，便于排查。
+        """
+        data = await self._request(API_PLUGIN_MARKET)
+        payload = data.get("data") if isinstance(data, dict) else data
+        if not decompress:
+            return payload
+        payload = _decompress_plugin_payload(payload)
+        # 解压后是 {"hapInfos": {"sign": ..., "allList": [...]}}，
+        # 把 hapInfos 的内容提上来，调用方直接用 allList。
+        if isinstance(payload, dict):
+            inner = payload.get("hapInfos")
+            if isinstance(inner, dict):
+                return inner
+        return payload
+
+    async def async_get_plugin_all(self) -> Any:
+        """市场 + 已安装合并视图（``GET /acelite/all_infos``）。"""
+        data = await self._request(API_PLUGIN_ALL)
+        return data.get("data") if isinstance(data, dict) else data
+
+    async def async_get_plugin_xunlei(self) -> Any:
+        """迅雷插件信息（``GET /acelite/xunlei_infos``）。"""
+        data = await self._request(API_PLUGIN_XUNLEI)
+        return data.get("data") if isinstance(data, dict) else data
+
+    async def async_install_plugin(self, plugin: dict[str, Any]) -> dict[str, Any]:
+        """安装 / 下载一个插件（``POST /acelite/hap_add``）。
+
+        请求体裁剪自插件 ``PluginAddRequestBean``，8 个字段：
+
+            appId, name, pkgName, downloadURL, iconURL,
+            uiURL, versionCode(int), versionName
+
+        正常用法是把 ``async_get_plugin_market()`` 里的某一项原样传进来，
+        所以这里按字段名从 dict 取；缺 ``appId`` / ``pkgName`` 视为无效请求。
+        """
+        app_id = str(plugin.get("appId") or "").strip()
+        pkg_name = str(plugin.get("pkgName") or "").strip()
+        if not app_id or not pkg_name:
+            raise ValueError("安装插件需要 appId 与 pkgName")
+        body = {
+            "appId": app_id,
+            "name": str(plugin.get("name") or ""),
+            "pkgName": pkg_name,
+            "downloadURL": str(plugin.get("downloadURL") or ""),
+            "iconURL": str(plugin.get("iconURL") or ""),
+            "uiURL": str(plugin.get("uiURL") or ""),
+            "versionCode": int(plugin.get("versionCode") or 0),
+            "versionName": str(plugin.get("versionName") or ""),
+        }
+        data = await self._request(API_PLUGIN_ADD, method="POST", json_body=body)
+        return data if isinstance(data, dict) else {"data": data}
+
+    async def async_install_plugin_by_id(self, app_id: str) -> dict[str, Any]:
+        """按市场里的 ``appId`` 直接安装（自动补齐 hap_add 所需字段）。
+
+        市场列表里的字段名是 ``iconUrl``/``downloadUrl``，而
+        ``PluginAddRequestBean`` 是 ``iconURL``/``downloadURL``，
+        这里统一映射后调用 :meth:`async_install_plugin`。
+        """
+        wanted = str(app_id).strip()
+        market = await self.async_get_plugin_market()
+        items: list[dict[str, Any]] = []
+        if isinstance(market, dict):
+            items = market.get("allList") or []
+        elif isinstance(market, list):
+            items = market
+        for item in items:
+            if str(item.get("appId") or "") != wanted:
+                continue
+            return await self.async_install_plugin(
+                {
+                    "appId": item.get("appId"),
+                    "name": item.get("name"),
+                    "pkgName": item.get("pkgName"),
+                    "downloadURL": item.get("downloadUrl") or item.get("downloadURL"),
+                    "iconURL": item.get("iconUrl") or item.get("iconURL"),
+                    "uiURL": item.get("uiUrl") or item.get("uiURL") or "",
+                    "versionCode": item.get("versionCode"),
+                    "versionName": item.get("versionName"),
+                }
+            )
+        raise ValueError(f"市场里没有 appId={wanted} 的应用")
+
+    async def async_confirm_plugin_perms(
+        self,
+        app_id: str,
+        pkg_name: str,
+        version: str = "",
+        confirm: int = 1,
+        perms: str = "",
+    ) -> dict[str, Any]:
+        """确认插件权限（``POST /acelite/hap_confirm``）。
+
+        请求体取自 ``PluginConfirmPermRequestBean``：
+        ``appId`` / ``pkgName`` / ``version`` / ``confirm``(int) / ``perms``。
+        安装流程里如果设备要求先授权，会返回待确认的权限项，确认后继续下载。
+        """
+        body = {
+            "appId": str(app_id),
+            "pkgName": str(pkg_name),
+            "version": str(version or ""),
+            "confirm": int(confirm),
+            "perms": str(perms or ""),
+        }
+        data = await self._request(API_PLUGIN_CONFIRM, method="POST", json_body=body)
+        return data if isinstance(data, dict) else {"data": data}
+
+    async def async_uninstall_plugin(
+        self, app_id: str, pkg_name: str, action: str = "delete"
+    ) -> dict[str, Any]:
+        """卸载 / 取消 / 暂停插件（``hap_delete`` / ``hap_cancel`` / ``hap_pause``）。
+
+        三者请求体一致（``PluginDeleteRequestBean``：``appId`` + ``pkgName``），
+        只是路径不同，所以合并成一个方法按 ``action`` 分派。
+        """
+        paths = {
+            "delete": API_PLUGIN_DELETE,
+            "cancel": API_PLUGIN_CANCEL,
+            "pause": API_PLUGIN_PAUSE,
+        }
+        path = paths.get(action)
+        if path is None:
+            raise ValueError(f"不支持的操作: {action}（只能是 delete/cancel/pause）")
+        body = {"appId": str(app_id), "pkgName": str(pkg_name)}
+        data = await self._request(path, method="POST", json_body=body)
+        return data if isinstance(data, dict) else {"data": data}
+
     async def async_query_duplicate_scan(
         self, task_id: int = 0, offset: int = 0, limit: int = 20, filter_: int = 0
     ) -> dict[str, Any]:
@@ -1152,18 +1365,36 @@ class HuaweiDeviceClient:
         return await self._request(API_DISK_SLEEP, method="POST")
 
     async def async_get_disk_basic_info(self) -> dict[str, Any]:
-        """当前磁盘状态（``/devmanage/diskBasicInfo``，GET）。
+        """当前磁盘状态（``POST /devmanage/diskBasicInfo``）。
 
-        ⚠️ **逆向推断**：deviceId query + 无 body，同 diskChange / devErrCode
-        形态，未实机验证。
+        ⚠️ 此前实现用 GET → 设备一律返回 ``code=1``（2026-10-28 实测）。
+        从插件反编译查到的真实调用是 **POST + DiskParam body**
+        （`HardDriveManageActivity.H3()`）：
+
+            DiskParam param = new DiskParam(null);      // slots = null
+            api.getDiskBasicInfo(param);                // POST /devmanage/diskBasicInfo
+
+        ``DiskParam`` 三个字段 ``slots`` / ``type`` / ``version``，此处
+        slots 传 null、type/version 保持 Java 默认 0（Gson 不序列化 null，
+        所以实际 body 是 ``{"type": 0, "version": 0}``）。
         """
-        data = await self._request(API_DISK_BASIC_INFO, method="GET")
+        data = await self._request(
+            API_DISK_BASIC_INFO,
+            method="POST",
+            json_body={"type": 0, "version": 0},
+        )
         return data.get("data") or {}
 
     async def async_get_disk_smart_info(self) -> dict[str, Any]:
-        """磁盘 SMART 健康（``/devmanage/diskSmartInfo``，GET）。
+        """磁盘 SMART 健康（``/devmanage/diskSmartInfo``）。
 
-        ⚠️ **逆向推断**：deviceId query + 无 body，未实机验证。
+        ⚠️ **App 并不调用这个端点**（2026-10-28 复核）：``diskSmartInfo``
+        只出现在 ``RequestUri$DeviceUri`` 的常量表里，整个插件的 Retrofit
+        接口（``DeviceApi`` 等）**没有任何方法指向它** —— 之前实现是从常量表
+        抄来的推断，设备实测返回 ``code=1``。
+
+        保留方法以便未来固件支持时直接可用，但调用方应把它当作
+        「可能不可用」，不要因为它的失败而判定磁盘故障。
         """
         data = await self._request(API_DISK_SMART_INFO, method="GET")
         return data.get("data") or {}
@@ -1575,7 +1806,6 @@ class HuaweiDeviceClient:
         ``fileId`` 来自 :meth:`async_prepare_upload` 的返回值。
         """
         return await self._request(
-            API_CANCEL_UPLOAD,
             method="POST",
             json_body={"clientType": DEVICE_CLIENT_TYPE, "deviceId": device_id,
                        "fids": list(fids)},
@@ -1764,6 +1994,50 @@ class HuaweiDeviceClient:
             },
         )
         return (data.get("data") or {}).get("tasks") or []
+
+    async def async_retry_task(
+        self,
+        task_id: int,
+        task_type: int,
+        business: str = "filesvc",
+        trans_id: str | None = None,
+    ) -> dict[str, Any]:
+        """重试失败的传输任务（``POST /{business}/retryTask``）。
+
+        报文格式来自插件反编译（`home_datacenter.apk` →
+        `transmission2/model/TaskRetryRequestBean` + `TransOtherPresenter`）：
+
+            POST /{business}/retryTask
+            {"business": "filesvc", "taskId": 123, "taskType": 400}
+
+        ``business`` 取任务所属域，插件里出现过的取值：
+        ``filesvc`` / ``gallery`` / ``trans`` / ``safebox``。
+
+        App 在 ``TransTaskUtils.e(taskType, business)`` 为真时还会补
+        ``deviceId`` / ``transId`` / ``isSupportSubTask=1``（与设备侧是否支持
+        子任务有关）。这里把 ``trans_id`` 做成可选入参：服务层会先从
+        ``task_status`` 里自动查同名任务的 ``transId`` 带上来，查不到就不带，
+        退回最简报文。
+
+        ⚠️ 实测（2026-10-28，taskId 不存在时）：返回 ``code=1101`` ——
+        不是参数错误码 ``1100``，说明端点在、且这份最简报文被设备接受，
+        只是目标任务不存在/不可重试。
+        """
+        await self.async_ensure_credentials()
+        body: dict[str, Any] = {
+            "business": business,
+            "taskId": int(task_id),
+            "taskType": int(task_type),
+        }
+        if trans_id:
+            body["transId"] = str(trans_id)
+            body["isSupportSubTask"] = 1
+        data = await self._request(
+            f"/{business}/retryTask",
+            method="POST",
+            json_body=body,
+        )
+        return data if isinstance(data, dict) else {"data": data}
 
     async def async_clean_task_records(
         self, task_ids: list[int], category: str = "user"

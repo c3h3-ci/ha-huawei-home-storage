@@ -73,6 +73,23 @@ _LOGGER = logging.getLogger(__name__)
 
 Executor = Callable[[Callable[..., Any], Any], Awaitable[Any]]
 
+# 账号密码模式的本地令牌缓存时长（秒）。
+#
+# ⚠️ 不设缓存会引发「登录状态反复跳」的连锁反应（2026-10-28 排查）：
+#   每次云 API 调用都会走 ``async_ensure_access_token``，而账号密码模式下
+#   它会无条件调用 ``token_provider``；provider 内部
+#     · ``async_refresh_session`` 没有过期判断，每次都真发一次续期请求；
+#     · 续期成功后把新会话快照写回 ``entry.data``；
+#   而 HA 只要 entry 字段有变化就会触发 update listener，本集成的
+#   listener 又是无条件 ``async_reload`` —— 于是
+#     API 请求 → 续期 → 改 entry.data → reload → setup → API 请求 → …
+#   集成被反复拆装，实体反复 unavailable、MQTT 反复断连，用户看到的就是
+#   「账号老是被登出」。这里给令牌加一层 TTL 缓存，切断这条循环的第一环。
+#
+# 取 1800s（30 分钟）：华为 oauth_access_token 有效期约 1 小时，留足安全余量；
+# 到期后仍然正常续期，不影响长时间的稳定性。
+_ACCOUNT_TOKEN_TTL = 1800
+
 # 华为在「用户尚未授权」时返回的是 HTTP 400 +
 # {"error":1101,"sub_error":20411,"error_description":"user code not scan"}，
 # 既不是标准 OAuth 的 authorization_pending，也不是真失败 —— 必须当作「继续等待」。
@@ -381,6 +398,8 @@ class HuaweiCloudClient:
         self._executor = executor
         self._token_provider = token_provider
         self._lock = asyncio.Lock()
+        # 账号密码模式的本地令牌缓存到期时间（time.monotonic 基准）
+        self._token_cache_until: float = 0.0
 
     # -- 会话生命周期 ------------------------------------------------------
     def set_executor(self, executor: Executor) -> None:
@@ -462,8 +481,22 @@ class HuaweiCloudClient:
           - 设备码模式：用 ``refresh_token`` 续期
         """
         if self._token_provider is not None:
-            self.access_token = await self._token_provider()
-            return self.access_token
+            # 账号密码模式。provider 内部会「先续期、失败再账号密码登录」，
+            # 每次调用都是一次真实网络请求 + 一次 entry.data 写入，所以必须
+            # 自己缓存，不能像设备码模式那样每次都问它。加锁避免并发请求
+            # （轮询 + MQTT 登录 + 相册统计可能同时进来）重复续期。
+            async with self._lock:
+                now = time.monotonic()
+                if self.access_token and now < self._token_cache_until:
+                    _LOGGER.debug(
+                        "账号令牌命中缓存，剩余 %.0f 秒（不重复续期）",
+                        self._token_cache_until - now,
+                    )
+                    return self.access_token
+                _LOGGER.debug("账号令牌缓存未命中，发起续期/登录")
+                self.access_token = await self._token_provider()
+                self._token_cache_until = now + _ACCOUNT_TOKEN_TTL
+                return self.access_token
 
         async with self._lock:
             if self.access_token:
@@ -504,6 +537,8 @@ class HuaweiCloudClient:
 
     def invalidate_access_token(self) -> None:
         self.access_token = None
+        # 同时清掉本地 TTL 缓存，否则下次调用会以为「还在有效期内」
+        self._token_cache_until = 0.0
 
     # -- smarthome 云 ------------------------------------------------------
     def _cloud_headers(self, access_token: str) -> dict[str, str]:
@@ -594,7 +629,40 @@ class HuaweiCloudClient:
         dev_mac: str,
         product: str,
     ) -> DeviceCredentials:
-        """完整链路：登录 → MQTT startService → ECDH 解密 → 设备凭据。"""
+        """完整链路：登录 → MQTT startService → ECDH 解密 → 设备凭据。
+
+        ⚠️ 令牌失效时自动清缓存重试一次（2026-10-28 加）：
+
+        华为的 token 可能在本端 TTL 还没到期时就失效（服务端提前回收、
+        多端登录互踢等）。此时若直接把异常抛上去，coordinator 会把设备侧
+        401 转成 ``ConfigEntryAuthFailed`` —— HA 会弹「需要重新认证」，
+        用户看到的就是「账号老是被登出」。这里先静默重取一次令牌，
+        绝大多数情况能自愈，不会打扰用户。
+        """
+        try:
+            return await self._async_fetch_credentials_once(
+                cloud_dev_id, uid, dev_mac, product
+            )
+        except HuaweiCloudError as err:
+            text = str(err).lower()
+            # 只对「可能是令牌问题」的错误重试一次；确定性的结构错误不浪费请求
+            if not isinstance(err, HuaweiCloudAuthError) and not any(
+                key in text for key in ("token", "401", "expired", "认证", "凭据失效")
+            ):
+                raise
+            _LOGGER.debug("取设备凭据失败，清除令牌缓存后重试一次: %s", err)
+            self.invalidate_access_token()
+            return await self._async_fetch_credentials_once(
+                cloud_dev_id, uid, dev_mac, product
+            )
+
+    async def _async_fetch_credentials_once(
+        self,
+        cloud_dev_id: str,
+        uid: str,
+        dev_mac: str,
+        product: str,
+    ) -> DeviceCredentials:
         login = await self.async_cloud_login()
         topic = login.get("mqttTopic") or MQTT_DEFAULT_TOPIC
         client_id = login.get("mqttClientId")

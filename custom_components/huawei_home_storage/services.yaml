@@ -224,6 +224,179 @@ task_status:
       default: false
       selector: {boolean: {}}
 
+plugin_install:
+  name: 安装插件
+  description: >-
+    从应用市场安装轻应用（/acelite/hap_add）。只需给 app_id，其余字段
+    （pkgName/downloadURL/iconURL/versionCode…）自动从市场列表补齐。
+    安装可能在设备侧异步下载，可用 plugin_all 观察 installedHap 变化。
+  fields:
+    entry_id:
+      name: 配置条目 ID
+      required: false
+      selector: {text: {}}
+    app_id:
+      name: 应用 ID
+      description: 见 plugin_market 返回的 allList[].appId（与 download_url 二选一）
+      required: false
+      example: C979782581979458432
+      selector: {text: {}}
+    download_url:
+      name: 自定义包地址
+      description: 给了它就绕过市场，直接按此 URL 安装（需同时填 pkg_name）
+      required: false
+      selector: {text: {}}
+    pkg_name:
+      name: 包名
+      description: 自定义来源时必填，如 com.example.app
+      required: false
+      selector: {text: {}}
+    name:
+      name: 显示名
+      required: false
+      selector: {text: {}}
+    icon_url:
+      name: 图标地址
+      required: false
+      selector: {text: {}}
+    ui_url:
+      name: 界面地址
+      required: false
+      selector: {text: {}}
+    version_code:
+      name: 版本号（整数）
+      required: false
+      selector: {number: {mode: box, min: 0}}
+    version_name:
+      name: 版本名
+      required: false
+      selector: {text: {}}
+
+plugin_uninstall:
+  name: 卸载/取消/暂停插件
+  description: >-
+    对已装插件执行删除、取消下载或暂停（/acelite/hap_delete、hap_cancel、
+    hap_pause 三者请求体相同，按 action 分派）。
+  fields:
+    entry_id:
+      name: 配置条目 ID
+      required: false
+      selector: {text: {}}
+    app_id:
+      name: 应用 ID
+      required: true
+      selector: {text: {}}
+    pkg_name:
+      name: 包名
+      description: 见 plugin_all 返回的 installedHap[].pkgName
+      required: true
+      example: com.ionewu.owdl
+      selector: {text: {}}
+    action:
+      name: 操作
+      required: false
+      default: delete
+      selector:
+        select:
+          options: [delete, cancel, pause]
+
+plugin_market:
+  name: 插件市场列表
+  description: >-
+    列出应用市场里可安装的轻应用/插件（/acelite/market_infos）。只读。
+    返回项含 appId / name / pkgName / downloadURL / versionCode 等，
+    可直接作为 plugin_install 的入参。
+  fields:
+    entry_id:
+      name: 配置条目 ID
+      required: false
+      selector: {text: {}}
+
+plugin_all:
+  name: 插件市场+已装
+  description: 市场与已安装的合并视图（/acelite/all_infos）。只读。
+  fields:
+    entry_id:
+      name: 配置条目 ID
+      required: false
+      selector: {text: {}}
+
+plugin_xunlei:
+  name: 迅雷插件信息
+  description: 迅雷插件状态（/acelite/xunlei_infos）。只读。
+  fields:
+    entry_id:
+      name: 配置条目 ID
+      required: false
+      selector: {text: {}}
+
+dynamic_info:
+  name: 动态 / 时光轴
+  description: >-
+    拉取 App 首页的「动态 / 回忆 / 时光轴」（/gallery/getDynamicInfo）。只读。
+    data_type 是动态类型枚举（默认 0）；不确定时用 probe=true 一次性试 0~9，
+    看哪个值有数据。
+  fields:
+    entry_id:
+      name: 配置条目 ID
+      required: false
+      selector: {text: {}}
+    owner_id:
+      name: 用户 ID
+      description: 留空/0 表示当前账号
+      required: false
+      default: 0
+      selector: {number: {mode: box, min: 0}}
+    data_type:
+      name: 动态类型
+      description: 插件里由 setDataType() 决定，默认 0
+      required: false
+      default: 0
+      selector: {number: {mode: box, min: 0, max: 20}}
+    probe:
+      name: 探测模式
+      description: 勾选后一次性尝试 dataType 0~9（只读，安全）
+      required: false
+      default: false
+      selector: {boolean: {}}
+
+retry_task:
+  name: 重试传输任务
+  description: >-
+    重试任务中心里失败的任务（上传/下载/同步）。task_id 与 task_type 从
+    task_status 返回的列表里取；business 是任务所属域，与 task_status 的
+    service 字段同一组取值。
+  fields:
+    entry_id:
+      name: 配置条目 ID
+      required: false
+      selector: {text: {}}
+    task_id:
+      name: 任务 ID
+      description: 从 task_status 返回的 taskId
+      required: true
+      example: 123
+      selector: {number: {mode: box, min: 0}}
+    task_type:
+      name: 任务类型
+      description: 从 task_status 返回的 taskType（如 400/401/402…）
+      required: true
+      example: 400
+      selector: {number: {mode: box, min: 0}}
+    business:
+      name: 业务域
+      description: 任务所属域，与 task_status 的 service 一致
+      required: false
+      default: filesvc
+      selector:
+        select:
+          options: [filesvc, gallery, trans, safebox]
+    trans_id:
+      name: 传输 ID（可选）
+      description: 留空则自动从 task_status 里查同一任务的 transId
+      required: false
+      selector: {text: {}}
+
 clean_task_records:
   name: 清除任务记录
   description: 清除任务中心的历史记录（只影响任务列表显示，不碰任何文件）
