@@ -80,7 +80,6 @@ SERVICE_PLUGIN_UNINSTALL = "plugin_uninstall"
 SERVICE_ADD_TO_ALBUM = "add_to_album"
 # 上传照片**进相册**（走 /gallery/prepareUpload 拿相册域 fileId，
 # 而非 /filesvc 的文件域）—— 见 transfer.upload_stream(service_type=...)。
-SERVICE_UPLOAD_TO_ALBUM = "upload_to_album"
 # 全量照片表（面板批量加载用）
 SERVICE_PHOTOS_TABLE_FULL = "photos_table_full"
 SERVICE_SHARE_TO_PERSON = "share_to_person"
@@ -1465,87 +1464,6 @@ async def async_register_services(hass: HomeAssistant) -> None:
             return {"ok": False, "error": str(exc), "row_id": row_id}
         return {"ok": True, **res, "row_id": row_id}
 
-    async def _upload_to_album(call: "ServiceCall") -> "ServiceResponse":
-        """上传照片到**相册**（一步：gallery 域上传 + 可选加入指定相册）。
-
-        与 ``upload_file`` 的关键区别：走 ``/gallery/prepareUpload`` 而不是
-        ``/filesvc/prepareUpload``，因此设备把文件**纳入相册索引**，并返回
-        相册域 fileId（281…）——``/gallery/addAlbumMemb`` 只认这个域的文件域
-        id（288…）会被拒（实测 code=30101）。
-
-        ``local_path`` 只能读 HA 的 ``/config/uploads`` 下（与 upload_file 同约束）。
-        """
-        runtime, entry, err = _pick(hass, call.data.get("entry_id"))
-        if err:
-            return err
-        if (bad := _need_device_id(entry)) is not None:
-            return bad
-        local_path = call.data.get("local_path")
-        if not local_path:
-            return {"ok": False, "error": "local_path 必填（本服务只支持从 HA 主机文件上传）"}
-
-        import os as _os  # noqa: PLC0415
-
-        root = _allowed_upload_dir(hass)
-        real = _os.path.realpath(local_path)
-        if not (real == root or real.startswith(root + _os.sep)):
-            return {
-                "ok": False,
-                "error": f"local_path 只允许读取 {root} 下的文件（防止读到敏感配置）",
-            }
-        def _read() -> bytes:
-            with open(real, "rb") as fh:
-                return fh.read()
-
-        try:
-            # ⚠️ 同步 open 会被 HA 判为阻塞事件循环 → 丢到线程里
-            payload = await hass.async_add_executor_job(_read)
-        except OSError as exc:
-            return {"ok": False, "error": f"读取文件失败: {exc}"}
-        if not payload:
-            return {"ok": False, "error": "文件为空"}
-
-        from .transfer import upload_stream  # noqa: PLC0415
-
-        fname = _os.path.basename(real)
-        dest_path = f"{FILE_ROOT_PATH.rstrip('/')}/MemoSpace/{fname}"
-        album_id = call.data.get("album_id")
-        album_type = int(call.data.get("album_type") or 6)
-
-        def _chunks():
-            yield payload
-
-        res = await upload_stream(
-            runtime.client,
-            dest_path,
-            len(payload),
-            _chunks(),
-            device_id=_entry_device_id(entry),
-            category=call.data.get("category") or "user",
-            service_type=SERVICE_TYPE_GALLERY,
-            # 相册域的 hash 字段要真实文件 MD5（秒传/去重），传原始字节
-            file_bytes=payload,
-        )
-        file_id = (res or {}).get("fileId") or ((res or {}).get("data") or {}).get("fileId")
-        out: dict[str, Any] = {"ok": True, "path": dest_path, "fileId": file_id}
-
-        # 可选：紧接着加入指定相册（用刚拿到的相册域 fileId）
-        if album_id and file_id:
-            try:
-                add = await runtime.client.async_add_album_members(
-                    int(album_id), [file_id],
-                    album_name=call.data.get("album_name") or "",
-                    album_type=album_type,
-                )
-                fail_ids = (add or {}).get("failIds") or []
-                out["album_id"] = int(album_id)
-                out["added"] = not fail_ids
-                if fail_ids:
-                    out["album_error"] = f"已上传，但加入相册失败: {fail_ids}"
-            except Exception as exc:  # noqa: BLE001
-                out["album_error"] = f"已上传，但加入相册失败: {exc}"
-        return out
-
     async def _upload_file(call: "ServiceCall") -> "ServiceResponse":
         """上传文件到设备文件空间（``prepareUpload`` + 数据通道 ``/upload``）。
 
@@ -1914,18 +1832,6 @@ async def async_register_services(hass: HomeAssistant) -> None:
             **entry_field,
             vol.Optional("row_id"): vol.Coerce(int),
             vol.Optional("num"): vol.Coerce(int),
-        }),
-        supports_response=SupportsResponse.ONLY,
-    )
-    hass.services.async_register(
-        DOMAIN, SERVICE_UPLOAD_TO_ALBUM, _upload_to_album,
-        schema=vol.Schema({
-            **entry_field,
-            vol.Required("local_path"): str,
-            vol.Optional("album_id"): vol.Coerce(int),
-            vol.Optional("album_type"): vol.Coerce(int),
-            vol.Optional("album_name"): str,
-            vol.Optional("category"): CATEGORY,
         }),
         supports_response=SupportsResponse.ONLY,
     )

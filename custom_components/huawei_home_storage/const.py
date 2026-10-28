@@ -113,6 +113,15 @@ API_PHOTOS_FULL = "/gallery/getFullPhotosInfoTable"
 # 拿文件域的去加会被拒（实测 code=30101）。
 API_GALLERY_PREPARE_UPLOAD = "/gallery/prepareUpload"
 
+# 面板「按用户分配账号」的映射键（entry.data[CONF_USER_ACCOUNT_MAP] = {HA用户名: 账号key}）。
+#
+# ⚠️ views.py 一直在读它，但此前 const.py 从未定义 —— 因为是**函数内延迟导入**，
+# 不影响集成加载，但每次面板请求走到账号过滤那步都会 ImportError。
+# 这里补上常量避免崩溃；注意「写入端」仍缺失（options flow 没有
+# async_step_user_accounts，翻译里却有该步骤文案）—— 功能尚未接通，
+# 读不到映射时按「不限制」处理。
+CONF_USER_ACCOUNT_MAP = "user_account_map"
+
 #: 数据通道 ``service`` 取值（逆向自 transmission2/constant/ServiceType.smali）：
 #:   "filesvc"=FILE / "gallery"=GALLERY / "safebox"=SAFE_BOX / "unknown"=UNKNOWN
 SERVICE_TYPE_FILE = "filesvc"
