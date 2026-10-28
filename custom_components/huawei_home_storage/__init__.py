@@ -56,6 +56,10 @@ _LOGGER = logging.getLogger(__name__)
 TOKEN_STORE_VERSION = 1
 TOKEN_STORE_KEY = "refresh_token"
 
+# 每个条目的 options 基线快照，用来区分「用户改了选项」与「令牌快照回写」。
+# 见 _async_update_listener：后者不该触发 reload。
+_LAST_OPTIONS: dict[str, dict[str, Any]] = {}
+
 HuaweiConfigEntry = ConfigEntry  # 运行期实际携带 HuaweiStorageData（runtime_data）
 
 
@@ -107,10 +111,15 @@ def _account_token_provider(
         token = huawei_account.access_token_of(session)
         if not token:
             raise HuaweiCloudAuthError("未能取得华为云端访问令牌")
-        data = await store.async_load() or {}
         snap = huawei_account.session_to_dict(session)
-        data[CONF_SMART_SESSION] = snap
-        await store.async_save(data)
+        stored = await store.async_load() or {}
+        stored_snap = stored.get(CONF_SMART_SESSION)
+        account_snap = account.get("smart_session") if account is not None else stored_snap
+        if snap == stored_snap and account_snap == snap:
+            # 令牌和快照都没变：不写盘、不动 entry（避免无意义的 IO 与变更）
+            return token
+        if snap != stored_snap:
+            await store.async_save({**stored, CONF_SMART_SESSION: snap})
         if account is not None and entry is not None:
             # 同步回条目里的账号快照：否则每次重启都会拿 3 小时前的旧 token，
             # 导致 message-center 报 200201 Token is expired
@@ -434,6 +443,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: HuaweiConfigEntry) -> bo
     _prune_stale_account_devices(hass, entry, accounts)
 
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+    # 登记 options 基线：之后只有用户真的改选项才会触发 reload
+    # （令牌快照回写 entry.data 不重载，避免 API→reload→API 的死循环）
+    _LAST_OPTIONS[entry.entry_id] = dict(entry.options)
     # 备份目标新增一个 → 让 HA 重新收集（实现 backup 平台监听器时才有效）
     _notify_backup_agents(hass)
 
@@ -548,6 +560,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: HuaweiConfigEntry) -> b
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
         hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
+        _LAST_OPTIONS.pop(entry.entry_id, None)
         if not hass.data.get(DOMAIN):
             async_unregister_views(hass)
             await async_unregister_panel(hass)
@@ -555,7 +568,32 @@ async def async_unload_entry(hass: HomeAssistant, entry: HuaweiConfigEntry) -> b
 
 
 async def _async_update_listener(hass: HomeAssistant, entry: HuaweiConfigEntry) -> None:
-    """Reload when options change."""
+    """只在 options 真的变化时重载集成。
+
+    ⚠️ 不能无条件 ``async_reload``（2026-10-28 修）：
+
+    账号密码模式下，每次云 API 调用都会走 ``async_ensure_access_token`` →
+    ``_account_token_provider``，而 provider 续期成功后会把**新的会话快照写回
+    ``entry.data``**（这是必要的：否则重启会拿到过期 token）。但 HA 对 entry
+    的**任意**字段变化都会调用本 listener —— 无条件 reload 就形成死循环：
+
+        云 API 请求 → 续期令牌 → 写 entry.data → 触发 listener → reload
+        → 重新 setup → 下一次云 API 请求 → …
+
+    症状是实体反复 unavailable、MQTT 反复断连，用户感知为「账号老是被登出」。
+    这里只对 ``options`` 变化做出反应（用户改设置才需要重载），``data`` 里的
+    令牌快照更新则直接跳过。
+    """
+    current = dict(entry.options)
+    previous = _LAST_OPTIONS.get(entry.entry_id)
+    if previous is None:
+        # 首次回调只登记基线，不重载
+        _LAST_OPTIONS[entry.entry_id] = current
+        return
+    if previous == current:
+        # 只有 data（令牌快照）变了，无需重载
+        return
+    _LAST_OPTIONS[entry.entry_id] = current
     await hass.config_entries.async_reload(entry.entry_id)
 
 

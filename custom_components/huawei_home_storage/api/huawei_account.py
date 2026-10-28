@@ -16,12 +16,17 @@ from __future__ import annotations
 
 import logging
 from dataclasses import replace
+from datetime import datetime, timezone
 from typing import Any
 
 _LOGGER = logging.getLogger(__name__)
 
 #: 保留旧名字，仅为兼容既有引用（现已无外部依赖）
 SMARTHOME_DOMAIN = "huawei_smarthome"
+
+# 续期余量（秒）：令牌距离过期不足这么久就提前续，避免「请求发出时刚好过期」。
+# 与上游 huawei_smarthome 集成保持一致（它用 timedelta(minutes=5)）。
+_REFRESH_MARGIN_SECONDS = 300
 
 
 class HuaweiAccountError(Exception):
@@ -74,8 +79,37 @@ async def async_create_provider(hass: Any, account: str) -> Any:
     return _new_provider(hass, await async_current_identity(hass, account))
 
 
+def _expires_to_str(value: Any) -> str | None:
+    """把过期时间序列化成 ISO 字符串（None 原样返回）。"""
+    isoformat = getattr(value, "isoformat", None)
+    if callable(isoformat):
+        text = isoformat()
+        return text if isinstance(text, str) else None
+    return None
+
+
+def _expires_from_str(value: Any) -> datetime | None:
+    """把持久化的 ISO 字符串还原成带时区的 datetime；非法值视作未知。"""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
 def rebuild_session(hass: Any, stored: dict[str, Any], account: str) -> Any:
-    """用持久化的字段重建会话（HA 重启后继续用，无需重新登录）。"""
+    """用持久化的字段重建会话（HA 重启后继续用，无需重新登录）。
+
+    ⚠️ ``oauth_expires_at`` 必须一起持久化（2026-10-28 修）：此前这里硬编码
+    ``None``，而 ``AuthSession.is_oauth_valid()`` 对 ``None`` 的处理是「视为
+    有效」—— 于是重启后本集成**永远认为令牌没过期、从不主动续期**，等 token
+    真过期了就直接 401，coordinator 转成 ``ConfigEntryAuthFailed``，HA 弹出
+    「需要重新认证」。这就是「经常被登出」的另一半原因。
+    """
     from .domain.models import AuthSession
 
     return AuthSession(
@@ -83,7 +117,7 @@ def rebuild_session(hass: Any, stored: dict[str, Any], account: str) -> Any:
         user_id=stored.get("user_id") or "",
         service_token=stored.get("service_token") or "",
         oauth_access_token=stored.get("oauth_access_token"),
-        oauth_expires_at=None,
+        oauth_expires_at=_expires_from_str(stored.get("oauth_expires_at")),
         device_id=stored.get("device_id") or "",
         device_name=stored.get("device_name") or "huawei-smarthome",
         pushtmid=stored.get("pushtmid"),
@@ -98,6 +132,8 @@ def session_to_dict(session: Any) -> dict[str, Any]:
         "user_id": getattr(session, "user_id", None),
         "service_token": getattr(session, "service_token", None),
         "oauth_access_token": getattr(session, "oauth_access_token", None),
+        # 过期时间必须一起存：否则 rebuild 后无法判断令牌是否还有效
+        "oauth_expires_at": _expires_to_str(getattr(session, "oauth_expires_at", None)),
         "device_id": getattr(session, "device_id", None),
         "device_name": getattr(session, "device_name", None),
         "pushtmid": getattr(session, "pushtmid", None),
@@ -161,6 +197,26 @@ async def async_refresh_session(hass: Any, session: Any) -> Any:
     account = str(getattr(session, "account", "") or "")
     if not account:
         raise HuaweiAccountError("会话缺少账号信息，无法续期")
+    # 令牌还在有效期内就直接返回，不发续期请求。
+    #
+    # ⚠️ 这个判断此前缺失（2026-10-28 修）：``AuthSession.is_oauth_valid()``
+    # 早就在 api/domain/models.py 里实现好了（基于登录响应里的 ``expire_in``
+    # 算出 ``oauth_expires_at``），但**从没被调用过** —— 于是每次云 API 都
+    # 真发一次续期，续期成功又把新快照写回 entry.data，触发 HA 的
+    # update listener → 集成被反复 reload。用户看到的就是「登录状态来回跳」。
+    # 上游 huawei_smarthome 集成正是靠这一步（is_oauth_valid + 5 分钟余量）
+    # 避免了同样的问题。
+    #
+    # 余量取 300 秒：给网络抖动留出空间，同时避免「刚续完就快过期」。
+    #
+    # ``expires_at is None`` 时不走「跳过」分支：旧版本持久化的快照里没有这个
+    # 字段（当时还没序列化它），无法判断是否过期 —— 宁可续期一次拿到准确的
+    # 过期时间，也不要盲目用可能已失效的旧 token。续期一次后该字段就被写入，
+    # 之后恢复正常判断。
+    expires_at = getattr(session, "oauth_expires_at", None)
+    if expires_at is not None and session.is_oauth_valid(_REFRESH_MARGIN_SECONDS):
+        _LOGGER.debug("会话令牌仍在有效期内，跳过续期")
+        return session
     identity = await async_current_identity(hass, account)
     provider = _new_provider(hass, identity)
     session = replace(

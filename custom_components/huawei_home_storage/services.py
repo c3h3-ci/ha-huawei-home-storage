@@ -64,6 +64,16 @@ SERVICE_SEARCH_FILES = "search_files"
 SERVICE_PHOTO_INFO = "photo_info"
 SERVICE_TASK_STATUS = "task_status"
 SERVICE_CLEAN_TASK_RECORDS = "clean_task_records"
+# 重试失败的传输任务（POST /{business}/retryTask）
+SERVICE_RETRY_TASK = "retry_task"
+# 动态 / 时光轴 / 回忆（GET /gallery/getDynamicInfo）
+SERVICE_DYNAMIC_INFO = "dynamic_info"
+# acelite 轻应用（插件）市场：只读三件套
+SERVICE_PLUGIN_MARKET = "plugin_market"
+SERVICE_PLUGIN_ALL = "plugin_all"
+SERVICE_PLUGIN_XUNLEI = "plugin_xunlei"
+SERVICE_PLUGIN_INSTALL = "plugin_install"
+SERVICE_PLUGIN_UNINSTALL = "plugin_uninstall"
 SERVICE_ADD_TO_ALBUM = "add_to_album"
 SERVICE_SHARE_TO_PERSON = "share_to_person"
 SERVICE_ALBUM_INFO = "album_info"
@@ -461,6 +471,214 @@ async def async_register_services(hass: HomeAssistant) -> None:
         failed = (result.get("data") or {}).get("errorIdList") or []
         return {"ok": ok and not failed, "count": len(ids),
                 "failed_ids": failed, "error": dev_err, "result": result}
+
+    async def _retry_task(call: "ServiceCall") -> "ServiceResponse":
+        """重试失败的传输任务（``POST /{business}/retryTask``）。
+
+        报文格式取自插件反编译（``TaskRetryRequestBean``）：
+
+            {"business": "filesvc", "taskId": 123, "taskType": 400}
+
+        ``business`` 是任务所属域：``filesvc`` / ``gallery`` / ``trans`` /
+        ``safebox``（``task_status`` 的 ``service`` 就是同一组取值）。
+        ``taskId`` 与 ``taskType`` 从 ``task_status`` 返回的列表里取。
+        """
+        runtime, _, err = _pick(hass, call.data.get("entry_id"))
+        if err:
+            return err
+        task_id = int(call.data["task_id"])
+        task_type = int(call.data["task_type"])
+        business = str(call.data.get("business") or "filesvc").strip() or "filesvc"
+        # 先从任务中心查同一条任务的 transId：App 在部分任务类型上会带上它，
+        # 带上更接近真实报文；查不到就退回最简报文（已被设备接受）。
+        trans_id = call.data.get("trans_id")
+        if not trans_id:
+            try:
+                types = TASK_TYPES_DEFAULT.get(business) or TASK_TYPES_DEFAULT["filesvc"]
+                tasks = await runtime.client.async_get_task_status(
+                    [int(t) for t in types], service=business
+                )
+                for item in tasks:
+                    if int(item.get("taskId", -1)) == task_id:
+                        trans_id = item.get("transId")
+                        break
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.debug("查任务 transId 失败（继续用最简报文）: %s", exc)
+        _LOGGER.warning(
+            "重试任务 taskId=%s taskType=%s business=%s transId=%s",
+            task_id,
+            task_type,
+            business,
+            trans_id or "-",
+        )
+        try:
+            result = await runtime.client.async_retry_task(
+                task_id, task_type, business=business, trans_id=trans_id
+            )
+        except Exception as exc:  # noqa: BLE001
+            # 设备对非 0 业务码是**抛异常**（见 api/device.py 的 _request），
+            # 所以这里要自己把上下文补齐，别只回一句 error。
+            _LOGGER.error("重试任务失败(taskId=%s): %s", task_id, exc)
+            return {
+                "ok": False,
+                "task_id": task_id,
+                "task_type": task_type,
+                "business": business,
+                "trans_id": trans_id,
+                "error": str(exc),
+            }
+        ok, dev_err = _device_ok(result)
+        return {
+            "ok": ok,
+            "task_id": task_id,
+            "task_type": task_type,
+            "business": business,
+            "trans_id": trans_id,
+            "error": dev_err,
+            "result": result,
+        }
+
+    async def _plugin_install(call: "ServiceCall") -> "ServiceResponse":
+        """安装市场里的插件（``POST /acelite/hap_add``）。
+
+        只需给 ``app_id``（从 plugin_market 拿），其余字段自动补齐。
+        也可直接给 ``plugin``（完整的 marketplace 项）跳过查询。
+        """
+        runtime, _, err = _pick(hass, call.data.get("entry_id"))
+        if err:
+            return err
+        app_id = str(call.data.get("app_id") or "").strip()
+        download_url = str(call.data.get("download_url") or "").strip()
+
+        # 自定义来源：直接给 download_url + pkg_name 即可（绕过市场查询）。
+        # 用于验证「设备是否接受非官方来源的包」。
+        if download_url:
+            pkg_name = str(call.data.get("pkg_name") or "").strip()
+            if not pkg_name:
+                return {"ok": False, "error": "自定义来源需要同时提供 pkg_name"}
+            plugin = {
+                "appId": app_id or f"C{abs(hash(pkg_name)) % 10**18:018d}",
+                "name": str(call.data.get("name") or pkg_name),
+                "pkgName": pkg_name,
+                "downloadURL": download_url,
+                "iconURL": str(call.data.get("icon_url") or ""),
+                "uiURL": str(call.data.get("ui_url") or ""),
+                "versionCode": int(call.data.get("version_code") or 1),
+                "versionName": str(call.data.get("version_name") or "0.0.1"),
+            }
+            _LOGGER.warning("按自定义来源安装: %s <- %s", pkg_name, download_url)
+            try:
+                result = await runtime.client.async_install_plugin(plugin)
+            except Exception as exc:  # noqa: BLE001
+                return {"ok": False, "source": "custom", "pkg_name": pkg_name,
+                        "download_url": download_url, "error": str(exc)}
+            return {"ok": True, "source": "custom", "pkg_name": pkg_name,
+                    "download_url": download_url, "plugin": plugin, "result": result}
+
+        if not app_id:
+            return {"ok": False,
+                    "error": "需要 app_id（见 plugin_market），或给 download_url + pkg_name 走自定义来源"}
+        _LOGGER.warning("开始安装插件 appId=%s", app_id)
+        try:
+            result = await runtime.client.async_install_plugin_by_id(app_id)
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.error("安装插件失败(%s): %s", app_id, exc)
+            return {"ok": False, "app_id": app_id, "error": str(exc)}
+        return {"ok": True, "app_id": app_id, "result": result}
+
+    async def _plugin_uninstall(call: "ServiceCall") -> "ServiceResponse":
+        """卸载 / 取消 / 暂停插件（``hap_delete`` / ``hap_cancel`` / ``hap_pause``）。"""
+        runtime, _, err = _pick(hass, call.data.get("entry_id"))
+        if err:
+            return err
+        app_id = str(call.data.get("app_id") or "").strip()
+        pkg_name = str(call.data.get("pkg_name") or "").strip()
+        action = str(call.data.get("action") or "delete")
+        if not app_id or not pkg_name:
+            return {"ok": False, "error": "需要 app_id 与 pkg_name（见 plugin_all 的 installedHap）"}
+        _LOGGER.warning("插件操作 %s: %s (%s)", action, pkg_name, app_id)
+        try:
+            result = await runtime.client.async_uninstall_plugin(
+                app_id, pkg_name, action=action
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "app_id": app_id, "action": action, "error": str(exc)}
+        return {"ok": True, "app_id": app_id, "action": action, "result": result}
+
+    async def _plugin_market(call: "ServiceCall") -> "ServiceResponse":
+        """应用市场可安装插件（``GET /acelite/market_infos``，只读）。"""
+        runtime, _, err = _pick(hass, call.data.get("entry_id"))
+        if err:
+            return err
+        try:
+            data = await runtime.client.async_get_plugin_market()
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+        count = len(data) if isinstance(data, (list, dict)) else 0
+        return {"ok": True, "count": count, "data": data}
+
+    async def _plugin_all(call: "ServiceCall") -> "ServiceResponse":
+        """市场 + 已安装合并视图（``GET /acelite/all_infos``，只读）。"""
+        runtime, _, err = _pick(hass, call.data.get("entry_id"))
+        if err:
+            return err
+        try:
+            data = await runtime.client.async_get_plugin_all()
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+        count = len(data) if isinstance(data, (list, dict)) else 0
+        return {"ok": True, "count": count, "data": data}
+
+    async def _plugin_xunlei(call: "ServiceCall") -> "ServiceResponse":
+        """迅雷插件信息（``GET /acelite/xunlei_infos``，只读）。"""
+        runtime, _, err = _pick(hass, call.data.get("entry_id"))
+        if err:
+            return err
+        try:
+            data = await runtime.client.async_get_plugin_xunlei()
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "data": data}
+
+    async def _dynamic_info(call: "ServiceCall") -> "ServiceResponse":
+        """动态 / 时光轴 / 回忆（``GET /gallery/getDynamicInfo``）。
+
+        ``data_type`` 是动态类型枚举，插件里由
+        ``AlbumDynamicApi$Param.setDataType()`` 决定；这里默认 0，
+        并支持 ``probe: true`` 一次性把 0~9 都试一遍，方便在真机上
+        摸清哪个值有数据（只读，安全）。
+        """
+        runtime, _, err = _pick(hass, call.data.get("entry_id"))
+        if err:
+            return err
+        owner_id = int(call.data.get("owner_id") or 0)
+
+        if call.data.get("probe"):
+            results: dict[str, Any] = {}
+            for dt in range(0, 10):
+                try:
+                    data = await runtime.client.async_get_dynamic_info(
+                        owner_id=owner_id, data_type=dt
+                    )
+                    size = len(data) if isinstance(data, (list, dict)) else 0
+                    results[str(dt)] = {"ok": True, "size": size,
+                                        "sample": str(data)[:200]}
+                except Exception as exc:  # noqa: BLE001
+                    results[str(dt)] = {"ok": False, "error": str(exc)[:120]}
+            return {"ok": True, "probe": True, "owner_id": owner_id,
+                    "results": results}
+
+        data_type = int(call.data.get("data_type") or 0)
+        try:
+            data = await runtime.client.async_get_dynamic_info(
+                owner_id=owner_id, data_type=data_type
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.error("动态信息拉取失败(dataType=%s): %s", data_type, exc)
+            return {"ok": False, "data_type": data_type, "error": str(exc)}
+        count = len(data) if isinstance(data, (list, dict)) else 0
+        return {"ok": True, "data_type": data_type, "owner_id": owner_id,
+                "count": count, "data": data}
 
     async def _add_to_album(call: "ServiceCall") -> "ServiceResponse":
         """把**已有的照片**加进相册（``/gallery/addAlbumMemb``）。
@@ -1693,6 +1911,61 @@ async def async_register_services(hass: HomeAssistant) -> None:
             vol.Optional("task_types"): vol.All(cv.ensure_list, [vol.Coerce(int)]),
             vol.Optional("task_category", default=2): vol.Coerce(int),
             vol.Optional("all_tasks", default=False): cv.boolean,
+        }),
+        supports_response=SupportsResponse.ONLY,
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_PLUGIN_INSTALL, _plugin_install,
+        schema=vol.Schema({
+            **entry_field,
+            vol.Optional("app_id"): cv.string,
+            vol.Optional("download_url"): cv.string,
+            vol.Optional("pkg_name"): cv.string,
+            vol.Optional("name"): cv.string,
+            vol.Optional("icon_url"): cv.string,
+            vol.Optional("ui_url"): cv.string,
+            vol.Optional("version_code"): vol.Coerce(int),
+            vol.Optional("version_name"): cv.string,
+        }),
+        supports_response=SupportsResponse.ONLY,
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_PLUGIN_UNINSTALL, _plugin_uninstall,
+        schema=vol.Schema({
+            **entry_field,
+            vol.Required("app_id"): cv.string,
+            vol.Required("pkg_name"): cv.string,
+            vol.Optional("action", default="delete"): vol.In(["delete","cancel","pause"]),
+        }),
+        supports_response=SupportsResponse.ONLY,
+    )
+    for _svc, _func in (
+        (SERVICE_PLUGIN_MARKET, _plugin_market),
+        (SERVICE_PLUGIN_ALL, _plugin_all),
+        (SERVICE_PLUGIN_XUNLEI, _plugin_xunlei),
+    ):
+        hass.services.async_register(
+            DOMAIN, _svc, _func,
+            schema=vol.Schema({**entry_field}),
+            supports_response=SupportsResponse.ONLY,
+        )
+    hass.services.async_register(
+        DOMAIN, SERVICE_DYNAMIC_INFO, _dynamic_info,
+        schema=vol.Schema({
+            **entry_field,
+            vol.Optional("owner_id", default=0): vol.Coerce(int),
+            vol.Optional("data_type", default=0): vol.Coerce(int),
+            vol.Optional("probe", default=False): cv.boolean,
+        }),
+        supports_response=SupportsResponse.ONLY,
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_RETRY_TASK, _retry_task,
+        schema=vol.Schema({
+            **entry_field,
+            vol.Required("task_id"): vol.Coerce(int),
+            vol.Required("task_type"): vol.Coerce(int),
+            vol.Optional("business", default="filesvc"): cv.string,
         }),
         supports_response=SupportsResponse.ONLY,
     )

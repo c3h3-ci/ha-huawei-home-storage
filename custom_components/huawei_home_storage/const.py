@@ -109,6 +109,8 @@ API_RECYCLE_OPERATE = "/filesvc/recycleDelFiles"
 API_USB_STATUS = "/filesvc/usbStatus"
 # 上传第一步：申请文件占位，返回 fileId + sessionId（实测 2026-10-08 可用）
 API_PREPARE_UPLOAD = "/filesvc/prepareUpload"
+
+
 # 取消上传（端点实测存在，2026-10-08）
 API_CANCEL_UPLOAD = "/filesvc/cancelUpload"
 # 文件空间批量操作（删除/移动等），靠 query 的 operation= 区分（实测 2026-10-08）
@@ -133,6 +135,10 @@ API_ADD_SHARE_TO_PERSON = "/gallery/addShareToPerson"
 API_ALBUM_INFO = "/gallery/getAlbumInfo"
 # 相册中选中照片详情
 API_SELECTED_PHOTOS_INFO = "/gallery/getSelectedPhotosInfo"
+# 动态 / 时光轴 / 回忆（GET + QueryMap: ownerId / dataType / deviceId）
+# 报文格式取自插件反编译 AlbumNetApi.getDynamicInfo(@QueryMap Map)，
+# 键名与取值见 AlbumApi / AlbumDynamicPresenter。
+API_DYNAMIC_INFO = "/gallery/getDynamicInfo"
 # trans 域全量任务列表（GET，与 filesvc/getAllTaskStatus 分属不同域）
 API_TRANS_ALL_TASK = "/trans/getAllTask"
 API_DISK_CHANGE = "/devmanage/diskChange"
@@ -152,6 +158,17 @@ API_REPAIR_MODE_CHECK = "/devmanage/repairModeCheck"
 API_FILES_RECENT = "/filesvc/recent"
 API_FILES_ALL = "/filesvc/allFiles"
 API_PLUGIN_INSTALLED = "/acelite/installed_infos"
+# acelite 轻应用（插件）体系 —— 报文全部取自插件 PluginApi.smali
+API_PLUGIN_MARKET = "/acelite/market_infos"        # GET 可安装列表
+API_PLUGIN_ALL = "/acelite/all_infos"              # GET 市场+已装合并
+API_PLUGIN_XUNLEI = "/acelite/xunlei_infos"        # GET 迅雷插件信息
+API_PLUGIN_ADD = "/acelite/hap_add"                # POST 安装/下载（PluginAddRequestBean）
+API_PLUGIN_CONFIRM = "/acelite/hap_confirm"        # POST 权限确认（PluginConfirmPermRequestBean）
+API_PLUGIN_DELETE = "/acelite/hap_delete"          # POST 卸载（PluginDeleteRequestBean）
+API_PLUGIN_CANCEL = "/acelite/hap_cancel"          # POST 取消（PluginDeleteRequestBean）
+API_PLUGIN_PAUSE = "/acelite/hap_pause"            # POST 暂停（PluginDeleteRequestBean）
+API_PLUGIN_RESUME = "/acelite/hap_resume"          # POST 续传（PluginAddRequestBean）
+API_PLUGIN_AUTOUPG = "/acelite/autoupg"            # GET 设置 / POST（PluginAutogradeRquesetBean）
 API_DUP_QUERY = "/gallery/queryDuplicateScanData"
 API_DUP_CTRL = "/gallery/ctrlDuplicateScanTask"
 DUP_ACT_START = "start"
