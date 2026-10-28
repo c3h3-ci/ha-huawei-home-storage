@@ -105,6 +105,25 @@ API_PHOTOS_INC = "/gallery/getIncPhotosInfoTable"
 # 与增量的区别：增量是「变化的部分」（preRowId 游标），全量是「从头拉全部」
 # —— 面板首次加载 / 本地缓存重建时用它，避免逐张 album_photos 往返（2.5 万张不可行）。
 API_PHOTOS_FULL = "/gallery/getFullPhotosInfoTable"
+
+# 相册域上传（逆向自 App 插件 smali：TransmissionApi 有**两套**平行的 prepareUpload）
+#   @POST("/filesvc/prepareUpload")  filePrepareUpload    → 文件空间，返回 288… 文件域 fileId
+#   @POST("/gallery/prepareUpload")  galleryPrepareUpload → 相册域，  返回 281… 相册域 fileId
+# 后者才是「上传照片进相册」的入口：/gallery/addAlbumMemb 只认相册域 fileId，
+# 拿文件域的去加会被拒（实测 code=30101）。
+API_GALLERY_PREPARE_UPLOAD = "/gallery/prepareUpload"
+
+#: 数据通道 ``service`` 取值（逆向自 transmission2/constant/ServiceType.smali）：
+#:   "filesvc"=FILE / "gallery"=GALLERY / "safebox"=SAFE_BOX / "unknown"=UNKNOWN
+SERVICE_TYPE_FILE = "filesvc"
+SERVICE_TYPE_GALLERY = "gallery"
+
+#: 数据通道额外 query（App 有、我们此前缺）：serviceType=GALLERY / FILE / SAFE_BOX
+SERVICE_TYPE_FLAG = {
+    SERVICE_TYPE_FILE: "FILE",
+    SERVICE_TYPE_GALLERY: "GALLERY",
+    "safebox": "SAFE_BOX",
+}
 API_QUERY_BIN = "/gallery/queryBin"
 API_FILES = "/filesvc/files"
 API_RECYCLE = "/filesvc/recycleFiles"

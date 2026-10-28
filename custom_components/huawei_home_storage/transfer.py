@@ -22,6 +22,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 from collections.abc import AsyncIterator, Callable
 from typing import Any
@@ -29,7 +30,12 @@ from typing import Any
 import aiohttp
 
 from .api.device import encode_device_path
-from .const import API_PREPARE_UPLOAD, DATA_DOWNLOAD_PATH, DEVICE_CLIENT_TYPE
+from .const import (
+    API_GALLERY_PREPARE_UPLOAD,
+    API_PREPARE_UPLOAD,
+    DATA_DOWNLOAD_PATH,
+    DEVICE_CLIENT_TYPE,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -75,11 +81,24 @@ async def upload_stream(
     category: str = "user",
     chunk_size: int = CHUNK_SIZE,
     on_progress: Callable[[int], None] | None = None,
+    service_type: str = "filesvc",
+    file_bytes: bytes | None = None,
 ) -> dict[str, Any]:
     """把字节流分块上传到设备（内存占用 ≈ 一个 chunk）。
 
     ``total_size`` 必须准确（``prepareUpload`` 要声明大小）；调用方从
     ``Content-Length`` 或备份元数据里拿。
+
+    ``service_type`` 决定走哪套 prepareUpload（插件反编译：
+    ``TransmissionApi.filePrepareUpload`` → ``/filesvc/prepareUpload``，
+    ``galleryPrepareUpload`` → ``/gallery/prepareUpload``）：
+
+    * ``filesvc``：文件空间，files 元素用 ``srcPath``/``path``/``sessionId``/``taskId``
+    * ``gallery``：相册域，files 元素用 ``fileSrcPath``/``hdcPath``/``fileHash``
+      （**必须**提供真实文件 MD5，否则设备拒收；故相册域要求传 ``file_bytes``）
+
+    只有相册域上传的文件才会被纳入相册索引，``/gallery/addAlbumMemb`` 也只认
+    相册域返回的 fileId（文件域的会被 30101 拒绝）。
     """
     if total_size is None or total_size <= 0:
         raise TransferError(f"上传大小无效（{total_size}）：{dest_path}")
@@ -89,25 +108,52 @@ async def upload_stream(
     view_path = f"Pictures/MemoSpace/{fname}"
 
     # ① prepareUpload：声明总大小，拿 fileId / sessionId
+    #
+    # ⚠️ 两套报文结构完全不同（插件反编译 TransmissionApi：
+    #   filePrepareUpload    → /filesvc/prepareUpload → FilePrepareUploadRequestBean
+    #   galleryPrepareUpload → /gallery/prepareUpload → GalleryPrepareUploadRequestBean
+    #                                                   .$GalleryRequestBean）
+    # 相册域的 files 元素是 fileHash/fileSrcPath/hdcPath，没有 path/sessionId/taskId，
+    # 且 fileHash 必须是真实文件 MD5 —— 所以相册域上传必须传 file_bytes。
+    if service_type == "gallery":
+        if not file_bytes:
+            raise TransferError(
+                "相册域上传需要 file_bytes（用于计算 fileHash，设备据此秒传/去重）"
+            )
+        prep_path = API_GALLERY_PREPARE_UPLOAD
+        prep_files = [
+            {
+                "viewPath": view_path,
+                "fileSrcPath": src_path,
+                "hdcPath": dest_path,
+                "fileHash": hashlib.md5(file_bytes).hexdigest(),
+                "fileId": 0,
+                "fileSize": total_size,
+                "orientation": 0,
+            }
+        ]
+    else:
+        prep_path = API_PREPARE_UPLOAD
+        prep_files = [
+            {
+                "viewPath": view_path,
+                "srcPath": src_path,
+                "path": dest_path,
+                "sessionId": "",
+                "fileId": 0,
+                "fileSize": total_size,
+                "orientation": 0,
+                "taskId": 0,
+            }
+        ]
     prep = await client._request(  # noqa: SLF001（同包内复用）
-        API_PREPARE_UPLOAD,
+        prep_path,
         method="POST",
         params={"category": category},
         json_body={
             "deviceId": device_id,
             "uploadType": 1,
-            "files": [
-                {
-                    "viewPath": view_path,
-                    "srcPath": src_path,
-                    "path": dest_path,
-                    "sessionId": "",
-                    "fileId": 0,
-                    "fileSize": total_size,
-                    "orientation": 0,
-                    "taskId": 0,
-                }
-            ],
+            "files": prep_files,
         },
     )
     items = (prep.get("data") or {}).get("fileList") or []
@@ -139,7 +185,7 @@ async def upload_stream(
             "mediaType": "0",
             "mtime": str(start),
             "orientation": "0",
-            "service": "filesvc",
+            "service": service_type,
             "size": str(total_size),
             "sourceAlbum": "0",
             "srcPath": src_path,
